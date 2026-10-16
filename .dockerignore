@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+
+# Python cache & virtual environments
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Large Datasets & Archives (not needed inside container image)
+MAGFiLO_1.0_Kaggle_2026/
+Research Papers/
+*.tar.gz
+*.zip
+
+# Local experiment runs & outputs
+mlruns/
+outputs/
+mlflow.db
+
+# System files
+.DS_Store
+Thumbs.db
