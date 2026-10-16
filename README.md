@@ -6,23 +6,20 @@ Tested and benchmarked against the standardized **MAGFiLO 1.0 dataset** ($1,154$
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
 - [Overview & Architecture](#-overview--architecture)
 - [Key Features](#-key-features)
-- [Project Directory Structure](#-project-directory-structure)
-- [Installation & Quickstart](#-installation--quickstart)
 - [Docker Containerisation](#-docker-containerisation)
 - [Repeatable Inference CLI](#-repeatable-inference-cli)
 - [REST API Reference](#-rest-api-reference)
 - [MLflow Experiment Tracking](#-mlflow-experiment-tracking)
 - [Automated Testing](#-automated-testing)
 - [Performance Benchmarks](#-performance-benchmarks)
-- [Next.js TypeScript Contract](#-nextjs-typescript-contract)
 
 ---
 
-## 🔬 Overview & Architecture
+## Overview & Architecture
 
 Solar filaments are dense, cool plasma structures suspended along magnetic polarity inversion lines in the solar corona. When eruptive, they trigger Coronal Mass Ejections (CMEs) that pose severe threats to orbital satellites, GPS navigation, and terrestrial power grids.
 
@@ -70,7 +67,7 @@ This system provides a decoupled **two-tier architecture**:
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 * **Hierarchical Two-Stage Inference:** High-speed CNN screening ($\sim 8.5\text{ ms}$) skips heavy pixel segmentation on empty solar disks, saving GPU/CPU compute.
 * **4-Class Magnetic Chirality:** Classifies structural magnetic twist (*Left-bearing*, *Right-bearing*, *Unidentifiable*, *Ambiguous*).
@@ -83,94 +80,7 @@ This system provides a decoupled **two-tier architecture**:
 
 ---
 
-## 📁 Project Directory Structure
-
-```plaintext
-Solar-Filament/
-├── Dockerfile                          # Multi-stage production Docker container
-├── docker-compose.yml                  # API (Port 8000) & MLflow UI (Port 5000)
-├── requirements.txt                    # Frozen dependency specifications
-├── METRICS_AND_BENCHMARKS.md           # In-depth benchmark results & analysis
-├── mlflow.db                           # Local SQLite tracking database
-│
-├── scripts/
-│   └── inference.py                    # Repeatable standalone CLI inference tool
-│
-├── backend/
-│   ├── main.py                         # FastAPI application entry point
-│   ├── train_pipeline.py               # CLI pipeline trainer with MLflow flag
-│   ├── train_with_mlflow.py            # Dedicated MLflow experiment script
-│   ├── benchmark.py                    # Latency, throughput, and memory benchmark
-│   │
-│   ├── app/
-│   │   ├── schemas.py                  # Pydantic v2 typed data contracts
-│   │   ├── routes/
-│   │   │   ├── inference.py            # /detect, /segment, /analyze
-│   │   │   ├── telecast.py             # /telecast/process-frame, /sample-frame
-│   │   │   ├── dataset_routes.py       # /dataset/stats, /dataset/sample
-│   │   │   └── train_routes.py         # /train/start, /train/status
-│   │   └── services/
-│   │       └── pipeline_service.py     # Singleton inference and visual compositor
-│   │
-│   ├── ml/
-│   │   ├── cnn_model.py                # Stage 1: FilamentBasicCNN
-│   │   ├── unet_model.py               # Stage 2: SolarFilamentUNet & polygon extractor
-│   │   ├── losses.py                   # DiceLoss, DiceBCELoss & metric evaluators
-│   │   ├── dataset.py                  # PyTorch Dataset for MAGFiLO GONG images
-│   │   ├── trainer.py                  # Modular training loops & validation
-│   │   └── mlflow_tracker.py           # MLflow experiment lifecycle manager
-│   │
-│   ├── models/
-│   │   ├── basic_cnn.pth               # Pretrained Stage 1 CNN weights
-│   │   ├── cnn_training_report.json    # CNN metrics history
-│   │   ├── unet_segmenter.pth          # Pretrained Stage 2 U-Net weights
-│   │   └── unet_training_report.json   # U-Net metrics history
-│   │
-│   └── tests/
-│       ├── test_full_suite.py          # 17 comprehensive tests (invalid images, API, math)
-│       ├── test_api.py                 # REST endpoint test suite
-│       └── test_ml.py                  # PyTorch tensor & gradient unit tests
-│
-├── MAGFiLO_1.0_Kaggle_2026/             # Benchmark dataset (1,154 images, 8,199 anns)
-├── Research Papers/                    # 5 peer-reviewed IEEE / Scopus reference papers
-└── outputs/                            # Inferred masks, visual overlays & benchmark logs
-```
-
----
-
-## ⚙️ Installation & Quickstart
-
-### 1. Prerequisites
-* Python 3.10+ (tested on Python 3.11 and 3.13)
-* Git
-
-### 2. Environment Setup
-```bash
-# Clone the repository
-git clone https://github.com/your-username/Solar-Filament.git
-cd Solar-Filament
-
-# Create and activate virtual environment
-python -m venv .venv
-# On Windows:
-.venv\Scripts\activate
-# On Linux/macOS:
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-### 3. Launch the FastAPI Server
-```bash
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-```
-* **Swagger UI Documentation:** `http://localhost:8000/docs`
-* **Health Check:** `http://localhost:8000/health`
-
----
-
-## 🐳 Docker Containerisation
+## Docker Containerisation
 
 Run the API and MLflow tracking server simultaneously using Docker Compose:
 
@@ -188,7 +98,7 @@ docker-compose ps
 
 ---
 
-## 🎯 Repeatable Inference CLI
+## Repeatable Inference CLI
 
 The `scripts/inference.py` script enables reproducible evaluation on single images or entire observation folders:
 
@@ -212,7 +122,7 @@ python scripts/inference.py \
 
 ---
 
-## 📡 REST API Reference
+## REST API Reference
 
 | Method | Endpoint | Description |
 | :---: | :--- | :--- |
@@ -228,7 +138,7 @@ python scripts/inference.py \
 
 ---
 
-## 📊 MLflow Experiment Tracking
+## MLflow Experiment Tracking
 
 Track hyperparameters, loss trajectories, evaluation metrics, and PyTorch model artifacts:
 
@@ -248,7 +158,7 @@ Navigate to **`http://localhost:5000`** to view parameter logs, Dice/IoU charts,
 
 ---
 
-## 🧪 Automated Testing
+## Automated Testing
 
 A full automated test suite is provided in [`backend/tests/test_full_suite.py`](file:///c:/Users/vaibh/Desktop/Solar-Filament/backend/tests/test_full_suite.py), covering:
 1. **Invalid Images:** 0-byte empty files, corrupted byte payloads, plain text masquerading as images, negative/out-of-bounds thresholds, and malformed Base64 frames.
@@ -266,7 +176,7 @@ OK
 
 ---
 
-## 📈 Performance Benchmarks
+## Performance Benchmarks
 
 Inference latency, throughput, and memory consumption measured across batch sizes on the local test environment:
 
@@ -279,38 +189,8 @@ Inference latency, throughput, and memory consumption measured across batch size
 | **SolarFilamentUNet** | 4 | 299.72 ± 10.7 | 74.93 ms | 13.3 FPS | 538.8 MB |
 | **SolarFilamentUNet** | 16 | 1267.77 ± 38.1 | 79.24 ms | 12.6 FPS | 1376.8 MB |
 
-👉 *For full percentiles (P50, P95, P99), hardware details, and accuracy metrics, see [METRICS_AND_BENCHMARKS.md](file:///c:/Users/vaibh/Desktop/Solar-Filament/METRICS_AND_BENCHMARKS.md).*
+ *For full percentiles (P50, P95, P99), hardware details, and accuracy metrics, see [METRICS_AND_BENCHMARKS.md](file:///c:/Users/vaibh/Desktop/Solar-Filament/METRICS_AND_BENCHMARKS.md).*
 
 ---
-
-## 💻 Next.js TypeScript Contract
-
-Pre-configured TypeScript definitions for seamless frontend integration (`types/solar.ts`):
-
-```typescript
-export interface FilamentPolygon {
-  id: string;
-  segmentation: number[][]; // [[x0, y0, x1, y1, ...]]
-  bbox: [number, number, number, number]; // [x, y, width, height]
-  area: number;
-  confidence: number;
-  category_id: number;
-  category_name: string;
-}
-
-export interface SegmentationResponse {
-  success: boolean;
-  num_filaments_found: number;
-  total_filament_area: number;
-  coverage_percentage: number;
-  has_high_solar_activity: boolean;
-  filaments: FilamentPolygon[];
-  rle_mask?: { size: [number, number]; counts: string };
-  binary_mask_base64?: string;
-  inference_time_ms: number;
-}
-```
-Directly render the annotated visual overlay in React:
-```tsx
-<img src={data.overlay_image_base64} alt="Solar Filament Detection Overlay" />
+lament Detection Overlay" />
 ```
