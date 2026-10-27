@@ -191,6 +191,3 @@ Inference latency, throughput, and memory consumption measured across batch size
 
  *For full percentiles (P50, P95, P99), hardware details, and accuracy metrics, see [METRICS_AND_BENCHMARKS.md](file:///c:/Users/vaibh/Desktop/Solar-Filament/METRICS_AND_BENCHMARKS.md).*
 
----
-lament Detection Overlay" />
-```
