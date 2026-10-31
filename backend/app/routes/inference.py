@@ -31,8 +31,8 @@ async def detect_filament(
     """
     try:
         content = await file.read()
-        _, image_tensor, _ = service.preprocess_image(content)
-        result = service.detect_presence(image_tensor)
+        img_orig, image_tensor, _ = service.preprocess_image(content)
+        result = service.detect_presence(image_tensor, img_orig=img_orig)
         return result
     except HTTPException:
         raise
@@ -54,8 +54,8 @@ async def segment_filament(
         if threshold <= 0.0 or threshold >= 1.0:
             raise HTTPException(status_code=400, detail="Threshold must be strictly between 0.0 and 1.0 (e.g. 0.4).")
         content = await file.read()
-        _, image_tensor, orig_shape = service.preprocess_image(content)
-        result, _ = service.segment_filaments(image_tensor, orig_shape, threshold=threshold)
+        img_orig, image_tensor, orig_shape = service.preprocess_image(content)
+        result, _ = service.segment_filaments(image_tensor, orig_shape, threshold=threshold, img_orig=img_orig)
         return result
     except HTTPException:
         raise
