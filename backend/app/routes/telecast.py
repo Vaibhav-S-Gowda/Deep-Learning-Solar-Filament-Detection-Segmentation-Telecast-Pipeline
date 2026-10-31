@@ -113,6 +113,7 @@ async def live_telecast_stream(
     threshold: float = Query(0.4, ge=0.1, le=0.9, description="Filament segmentation threshold"),
     overlay: bool = Query(True, description="Whether to overlay filament segmentation masks"),
     hud: bool = Query(True, description="Whether to burn observatory HUD graphics onto the video stream"),
+    start_index: int = Query(0, ge=0, description="Starting frame index in sequence (supports pause/resume)"),
     service: SolarPipelineService = Depends(get_pipeline_service)
 ):
     """
@@ -128,94 +129,97 @@ async def live_telecast_stream(
     frame_delay = 1.0 / max(1, min(fps, 30))
 
     async def generate_mjpeg_stream():
-        idx = 0
+        idx = start_index
         total = len(files)
-        while True:
-            t0 = time.time()
-            filename = files[idx % total]
-            file_path = os.path.join(SAMPLE_IMAGES_DIR, filename)
+        try:
+            while True:
+                t0 = time.time()
+                filename = files[idx % total]
+                file_path = os.path.join(SAMPLE_IMAGES_DIR, filename)
 
-            img_orig = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-            if img_orig is not None:
-                st_code = filename[-7:-5] if len(filename) >= 7 else "GONG"
-                st_info = GONG_STATIONS.get(st_code, {"name": "GONG Network", "station_id": st_code})
-                obs_time = _parse_filename_date(filename)
+                img_orig = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+                if img_orig is not None:
+                    st_code = filename[-7:-5] if len(filename) >= 7 else "GONG"
+                    st_info = GONG_STATIONS.get(st_code, {"name": "GONG Network", "station_id": st_code})
+                    obs_time = _parse_filename_date(filename)
 
-                # Resize to standard 512x512 telecast transmission resolution
-                img_512 = cv2.resize(img_orig, (512, 512), interpolation=cv2.INTER_AREA)
+                    # Resize to standard 512x512 telecast transmission resolution
+                    img_512 = cv2.resize(img_orig, (512, 512), interpolation=cv2.INTER_AREA)
 
-                # Run Stage 2 U-Net segmentation
-                _, tensor, orig_shape = service.preprocess_image(cv2.imencode(".jpg", img_512)[1].tobytes())
-                seg_res, bin_mask = service.segment_filaments(tensor, orig_shape, threshold=threshold)
+                    # Run Stage 2 U-Net segmentation
+                    _, tensor, orig_shape = service.preprocess_image(cv2.imencode(".jpg", img_512)[1].tobytes())
+                    seg_res, bin_mask = service.segment_filaments(tensor, orig_shape, threshold=threshold)
 
-                # Build frame
-                if overlay:
-                    filaments_dict_list = [f.model_dump() for f in seg_res.filaments]
-                    frame_bgr = create_detection_overlay(img_512, bin_mask, filaments_dict_list)
-                else:
-                    frame_bgr = cv2.cvtColor(img_512, cv2.COLOR_GRAY2BGR)
+                    # Build frame
+                    if overlay:
+                        filaments_dict_list = [f.model_dump() for f in seg_res.filaments]
+                        frame_bgr = create_detection_overlay(img_512, bin_mask, filaments_dict_list)
+                    else:
+                        frame_bgr = cv2.cvtColor(img_512, cv2.COLOR_GRAY2BGR)
 
-                if hud:
-                    # Top telemetry HUD bar
-                    cv2.rectangle(frame_bgr, (0, 0), (512, 34), (10, 16, 26), -1)
-                    cv2.line(frame_bgr, (0, 34), (512, 34), (45, 60, 78), 1)
-                    # Blinking LIVE dot
-                    dot_color = (134, 240, 206) if (int(time.time() * 2) % 2 == 0) else (40, 160, 130)
-                    cv2.circle(frame_bgr, (14, 17), 5, dot_color, -1)
-                    cv2.putText(
-                        frame_bgr,
-                        f"LIVE TELECAST | {st_info['station_id']} - {st_info['name'][:22]}",
-                        (26, 21),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.38,
-                        (220, 235, 245),
-                        1,
-                        cv2.LINE_AA
-                    )
+                    if hud:
+                        # Top telemetry HUD bar
+                        cv2.rectangle(frame_bgr, (0, 0), (512, 34), (10, 16, 26), -1)
+                        cv2.line(frame_bgr, (0, 34), (512, 34), (45, 60, 78), 1)
+                        # Blinking LIVE dot
+                        dot_color = (134, 240, 206) if (int(time.time() * 2) % 2 == 0) else (40, 160, 130)
+                        cv2.circle(frame_bgr, (14, 17), 5, dot_color, -1)
+                        cv2.putText(
+                            frame_bgr,
+                            f"LIVE TELECAST | {st_info['station_id']} - {st_info['name'][:22]}",
+                            (26, 21),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.38,
+                            (220, 235, 245),
+                            1,
+                            cv2.LINE_AA
+                        )
 
-                    # Bottom telemetry HUD bar
-                    cv2.rectangle(frame_bgr, (0, 478), (512, 512), (10, 16, 26), -1)
-                    cv2.line(frame_bgr, (0, 478), (512, 478), (45, 60, 78), 1)
+                        # Bottom telemetry HUD bar
+                        cv2.rectangle(frame_bgr, (0, 478), (512, 512), (10, 16, 26), -1)
+                        cv2.line(frame_bgr, (0, 478), (512, 478), (45, 60, 78), 1)
 
-                    act_label = "HIGH ACTIVITY" if seg_res.has_high_solar_activity else "NOMINAL"
-                    act_color = (98, 187, 244) if seg_res.has_high_solar_activity else (134, 240, 206)
+                        act_label = "HIGH ACTIVITY" if seg_res.has_high_solar_activity else "NOMINAL"
+                        act_color = (98, 187, 244) if seg_res.has_high_solar_activity else (134, 240, 206)
 
-                    cv2.putText(
-                        frame_bgr,
-                        f"{obs_time}  |  FILAMENTS: {seg_res.num_filaments_found}  |  AREA: {int(seg_res.total_filament_area):,} px",
-                        (10, 498),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.34,
-                        (180, 195, 210),
-                        1,
-                        cv2.LINE_AA
-                    )
-                    cv2.putText(
-                        frame_bgr,
-                        act_label,
-                        (410, 498),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.34,
-                        act_color,
-                        1,
-                        cv2.LINE_AA
-                    )
+                        cv2.putText(
+                            frame_bgr,
+                            f"{obs_time}  |  FILAMENTS: {seg_res.num_filaments_found}  |  AREA: {int(seg_res.total_filament_area):,} px",
+                            (10, 498),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.34,
+                            (180, 195, 210),
+                            1,
+                            cv2.LINE_AA
+                        )
+                        cv2.putText(
+                            frame_bgr,
+                            act_label,
+                            (410, 498),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.34,
+                            act_color,
+                            1,
+                            cv2.LINE_AA
+                        )
 
-                # JPEG encode
-                ret, buffer = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-                if ret:
-                    frame_bytes = buffer.tobytes()
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n" +
-                        frame_bytes + b"\r\n"
-                    )
+                    # JPEG encode
+                    ret, buffer = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+                    if ret:
+                        frame_bytes = buffer.tobytes()
+                        yield (
+                            b"--frame\r\n"
+                            b"Content-Type: image/jpeg\r\n"
+                            b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n" +
+                            frame_bytes + b"\r\n"
+                        )
 
-            idx += 1
-            elapsed = time.time() - t0
-            sleep_time = max(0.005, frame_delay - elapsed)
-            await asyncio.sleep(sleep_time)
+                idx += 1
+                elapsed = time.time() - t0
+                sleep_time = max(0.005, frame_delay - elapsed)
+                await asyncio.sleep(sleep_time)
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
 
     return StreamingResponse(
         generate_mjpeg_stream(),

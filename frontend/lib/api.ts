@@ -261,7 +261,8 @@ export function getLiveStreamUrl(
   threshold = 0.4,
   overlay = true,
   hud = true,
-  base = ""
+  base = "",
+  startIndex = 0
 ): string {
   const root = base ? normalizeBase(base) : "";
   const params = new URLSearchParams({
@@ -270,6 +271,7 @@ export function getLiveStreamUrl(
     threshold: String(threshold),
     overlay: String(overlay),
     hud: String(hud),
+    start_index: String(startIndex),
     t: String(Date.now()), // Cache bust on new connection
   });
   return `${root}/api/v1/telecast/stream?${params.toString()}`;

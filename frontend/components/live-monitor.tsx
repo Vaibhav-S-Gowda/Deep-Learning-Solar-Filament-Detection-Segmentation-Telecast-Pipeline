@@ -77,6 +77,7 @@ export default function LiveMonitor() {
 
   // Stream state
   const [streamUrl, setStreamUrl] = useState<string>("");
+  const [frozenFrame, setFrozenFrame] = useState<string | null>(null);
   const [backendStatus, setBackendStatus] = useState<TelecastStatus | null>(null);
   const [lastError, setLastError] = useState<string>("");
   const [activeFrame, setActiveFrame] = useState<SequenceFrameResponse | null>(null);
@@ -105,6 +106,8 @@ export default function LiveMonitor() {
   const thresholdRef = useRef(threshold);
   const isPlayingRef = useRef(false);
   const sequenceIndexRef = useRef(0);
+  const mjpegIndexRef = useRef(0);
+  const streamStartTimeRef = useRef(0);
   const seqTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   // Recorder refs
@@ -114,6 +117,7 @@ export default function LiveMonitor() {
   const recordTimerRef = useRef<NodeJS.Timeout | null>(null);
   const videoElemRef = useRef<HTMLVideoElement | null>(null);
   const imgStreamRef = useRef<HTMLImageElement | null>(null);
+  const frozenImgRef = useRef<HTMLImageElement | null>(null);
 
   endpointRef.current = endpoint;
   engineModeRef.current = engineMode;
@@ -176,13 +180,15 @@ export default function LiveMonitor() {
     }
   };
 
-  // Launch stream
+  // Launch or resume stream
   const startStream = useCallback(() => {
     setLastError("");
     isPlayingRef.current = true;
+    setFrozenFrame(null);
     setConnectionState("streaming");
 
     if (engineMode === "mjpeg") {
+      streamStartTimeRef.current = Date.now();
       const base = getBase();
       const url = getLiveStreamUrl(
         stationRef.current,
@@ -190,7 +196,8 @@ export default function LiveMonitor() {
         thresholdRef.current,
         viewLayer === "segmented",
         true,
-        base
+        base,
+        mjpegIndexRef.current
       );
       setStreamUrl(url);
     } else if (engineMode === "timelapse") {
@@ -231,32 +238,103 @@ export default function LiveMonitor() {
     }
   }, [engineMode, getBase, streamFps, viewLayer]);
 
-  const pauseStream = useCallback(() => {
+  const pauseStream = useCallback(async () => {
     isPlayingRef.current = false;
+    if (seqTimerRef.current) {
+      clearTimeout(seqTimerRef.current);
+      seqTimerRef.current = null;
+    }
+    if (videoElemRef.current) {
+      videoElemRef.current.pause();
+    }
+
+    if (engineModeRef.current === "mjpeg") {
+      // Calculate where we are in the sequence so resume can pick up from here
+      if (streamStartTimeRef.current > 0) {
+        const elapsed = (Date.now() - streamStartTimeRef.current) / 1000;
+        mjpegIndexRef.current += Math.max(0, Math.floor(elapsed * streamFps));
+      }
+
+      // Disconnect the backend MJPEG HTTP stream first
+      setStreamUrl("");
+
+      // Fetch the current frame as a static base64 snapshot to freeze on screen
+      try {
+        const base = getBase();
+        const snapshot = await getSequenceFrame(
+          stationRef.current,
+          mjpegIndexRef.current,
+          thresholdRef.current,
+          true,
+          base
+        );
+        const src =
+          snapshot.overlay_base64 ?? snapshot.frame_base64;
+        setFrozenFrame(src);
+        // Advance index so resume continues from next frame
+        mjpegIndexRef.current = snapshot.next_index;
+      } catch {
+        setFrozenFrame(null);
+      }
+    }
+
     setConnectionState("paused");
-    if (seqTimerRef.current) clearTimeout(seqTimerRef.current);
-    if (videoElemRef.current) videoElemRef.current.pause();
-  }, []);
+  }, [streamFps, getBase]);
 
   const stopStream = useCallback(() => {
     isPlayingRef.current = false;
     setConnectionState("connected");
     setStreamUrl("");
+    setFrozenFrame(null);
     setActiveFrame(null);
-    if (seqTimerRef.current) clearTimeout(seqTimerRef.current);
+    sequenceIndexRef.current = 0;
+    mjpegIndexRef.current = 0;
+    streamStartTimeRef.current = 0;
+
+    if (seqTimerRef.current) {
+      clearTimeout(seqTimerRef.current);
+      seqTimerRef.current = null;
+    }
     if (videoElemRef.current) {
       videoElemRef.current.pause();
       videoElemRef.current.currentTime = 0;
     }
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    setIsRecording(false);
+    if (recordTimerRef.current) {
+      clearInterval(recordTimerRef.current);
+      recordTimerRef.current = null;
+    }
+
+    setMetrics({
+      filaments: 0,
+      area: 0,
+      latency: 0,
+      highActivity: false,
+      timestamp: "Awaiting stream initialization",
+    });
   }, []);
 
-  // Handle engine mode or station change while running
+  // Handle engine mode or station change while streaming — restart stream.
+  // If paused when params change, drop back to connected (params mismatch).
+  // NOTE: connectionState intentionally excluded from deps to avoid resetting on every pause.
   useEffect(() => {
     if (connectionState === "streaming") {
       if (seqTimerRef.current) clearTimeout(seqTimerRef.current);
       startStream();
+    } else if (connectionState === "paused") {
+      // Params changed while paused — just stop cleanly
+      setFrozenFrame(null);
+      setActiveFrame(null);
+      sequenceIndexRef.current = 0;
+      mjpegIndexRef.current = 0;
+      streamStartTimeRef.current = 0;
+      setConnectionState("connected");
     }
-  }, [engineMode, selectedStation, streamFps, viewLayer, startStream, connectionState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [engineMode, selectedStation, streamFps, viewLayer]);
 
   // Real-Time Video Recording Engine
   const startRecording = () => {
@@ -348,11 +426,19 @@ export default function LiveMonitor() {
       ctx.fillStyle = "#10151b";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      if (engineMode === "mjpeg" && imgStreamRef.current && imgStreamRef.current.complete) {
-        try {
-          ctx.drawImage(imgStreamRef.current, 0, 0, canvas.width, canvas.height);
-        } catch {
-          // Handled gracefully during frame updates
+      if (engineMode === "mjpeg") {
+        if (imgStreamRef.current && imgStreamRef.current.complete) {
+          try {
+            ctx.drawImage(imgStreamRef.current, 0, 0, canvas.width, canvas.height);
+          } catch {
+            // Handled gracefully during frame updates
+          }
+        } else if (frozenImgRef.current && frozenImgRef.current.complete) {
+          try {
+            ctx.drawImage(frozenImgRef.current, 0, 0, canvas.width, canvas.height);
+          } catch {
+            // Handled gracefully
+          }
         }
       } else if (engineMode === "timelapse" && activeFrame) {
         const imgObj = new Image();
@@ -395,7 +481,7 @@ export default function LiveMonitor() {
 
     animId = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(animId);
-  }, [engineMode, activeFrame, viewLayer, isRecording, recordSeconds]);
+  }, [engineMode, activeFrame, viewLayer, isRecording, recordSeconds, frozenFrame, connectionState]);
 
   const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -410,6 +496,7 @@ export default function LiveMonitor() {
   };
 
   const isStreaming = connectionState === "streaming";
+  const isPaused = connectionState === "paused";
 
   return (
     <main className="app-shell">
@@ -454,7 +541,13 @@ export default function LiveMonitor() {
           <div className="viewer-card">
             <div className="viewer-toolbar">
               <div className="viewer-title-group">
-                <span className="live-square" style={{ background: isStreaming ? "var(--success)" : "var(--text-muted)" }} />
+                <span
+                  className="live-square"
+                  style={{
+                    background: isStreaming ? "var(--success)" : isPaused ? "#e69242" : "var(--text-muted)",
+                    boxShadow: isStreaming ? "0 0 8px var(--success)" : isPaused ? "0 0 8px #e69242" : "none",
+                  }}
+                />
                 <div>
                   <div className="viewer-title">
                     {engineMode === "mjpeg" && "CONTINUOUS TELECAST STREAM (MJPEG)"}
@@ -469,7 +562,9 @@ export default function LiveMonitor() {
               </div>
               <div className="frame-meta">
                 <span className="meta-label">STATUS</span>
-                <span>{isStreaming ? (isRecording ? "RECORDING ACTIVE" : "STREAM ACTIVE") : "STANDBY"}</span>
+                <span style={{ color: isPaused ? "#e69242" : undefined, fontWeight: isPaused ? 600 : undefined }}>
+                  {isStreaming ? (isRecording ? "RECORDING ACTIVE" : "STREAM ACTIVE") : isPaused ? "TELECAST PAUSED" : "STANDBY"}
+                </span>
               </div>
             </div>
 
@@ -481,19 +576,25 @@ export default function LiveMonitor() {
               <div className="stage-corner stage-br" />
               <div className="stage-grid" aria-hidden="true" />
 
-              {/* Mode 1: Live MJPEG Stream */}
-              {engineMode === "mjpeg" && isStreaming && (
+              {/* Mode 1: Live MJPEG Stream — live img while streaming, frozen snapshot while paused */}
+              {engineMode === "mjpeg" && isStreaming && streamUrl && (
                 <img
                   ref={imgStreamRef}
                   className="solar-image"
                   src={streamUrl}
                   alt="Solar observation telecast with filament segmentation overlay"
-                  crossOrigin="anonymous"
+                />
+              )}
+              {engineMode === "mjpeg" && isPaused && frozenFrame && (
+                <img
+                  className="solar-image"
+                  src={frozenFrame}
+                  alt="Solar observation paused frame"
                 />
               )}
 
               {/* Mode 2: Chronological Sequence */}
-              {engineMode === "timelapse" && isStreaming && activeFrame && (
+              {engineMode === "timelapse" && (isStreaming || isPaused) && activeFrame && (
                 <img
                   className="solar-image"
                   src={
@@ -519,11 +620,19 @@ export default function LiveMonitor() {
               )}
 
               {/* Standby Empty State */}
-              {!isStreaming && (
+              {!isStreaming && !isPaused && (
                 <div className="empty-state">
                   <div className="empty-sun"><span /></div>
                   <div className="empty-title">OBSERVATION FEED INACTIVE</div>
                   <p>Initiate stream acquisition to connect to the observation pipeline.</p>
+                </div>
+              )}
+
+              {/* Paused overlay badge */}
+              {isPaused && (
+                <div className="telecast-paused-badge">
+                  <Pause size={12} fill="currentColor" />
+                  <span>TELECAST PAUSED</span>
                 </div>
               )}
 
@@ -539,9 +648,12 @@ export default function LiveMonitor() {
               <div className="stage-coordinate coord-bottom">
                 {activeFrame?.file_name || `${selectedStation} OBSERVATORY CALIBRATED`}
               </div>
-              {isStreaming && (
+              {(isStreaming || isPaused) && (
                 <div className="filament-count-badge">
-                  <span className="glow-dot" />
+                  <span
+                    className="glow-dot"
+                    style={isPaused ? { background: "#e69242", boxShadow: "0 0 8px #e69242" } : undefined}
+                  />
                   <span>{metrics.filaments} {metrics.filaments === 1 ? "FILAMENT DETECTED" : "FILAMENTS DETECTED"}</span>
                 </div>
               )}
@@ -595,25 +707,25 @@ export default function LiveMonitor() {
           <div className="metrics-row" aria-live="polite">
             <div className="metric-card">
               <span className="metric-label">FILAMENTS IDENTIFIED</span>
-              <strong>{isStreaming ? (metrics.filaments || "0") : "—"}</strong>
+              <strong>{isStreaming || isPaused ? (metrics.filaments || "0") : "—"}</strong>
               <span className="metric-foot">discrete structures</span>
             </div>
             <div className="metric-card">
               <span className="metric-label">SEGMENTED PIXEL AREA</span>
-              <strong>{isStreaming ? `${metrics.area.toLocaleString()}` : "—"}<small> px</small></strong>
+              <strong>{isStreaming || isPaused ? `${metrics.area.toLocaleString()}` : "—"}<small> px</small></strong>
               <span className="metric-foot">chromospheric footprint</span>
             </div>
             <div className="metric-card">
               <span className="metric-label">TRANSMISSION RATE</span>
-              <strong>{isStreaming ? `${streamFps}` : "—"}<small> FPS</small></strong>
-              <span className="metric-foot">pipeline target</span>
+              <strong>{isStreaming ? `${streamFps}` : isPaused ? "0" : "—"}<small> FPS</small></strong>
+              <span className="metric-foot">{isPaused ? "paused" : "pipeline target"}</span>
             </div>
             <div className="metric-card metric-state">
               <span className="metric-label">CHROMOSPHERIC STATE</span>
               <strong className={metrics.highActivity ? "activity-value" : "quiet-value"}>
-                {isStreaming ? (metrics.highActivity ? "Elevated" : "Nominal") : "Standby"}
+                {isStreaming || isPaused ? (metrics.highActivity ? "Elevated" : "Nominal") : "Standby"}
               </strong>
-              <span className="metric-foot">{isStreaming ? "continuous monitor" : "awaiting stream"}</span>
+              <span className="metric-foot">{isStreaming ? "continuous monitor" : isPaused ? "last reading" : "awaiting stream"}</span>
             </div>
           </div>
 
@@ -747,6 +859,10 @@ export default function LiveMonitor() {
                   <button className="button button-primary" type="button" onClick={pauseStream}>
                     <Pause size={14} style={{ marginRight: 6 }} /> Pause Telecast
                   </button>
+                ) : isPaused ? (
+                  <button className="button button-primary" type="button" onClick={startStream}>
+                    <Play size={14} style={{ marginRight: 6 }} fill="currentColor" /> Resume Telecast
+                  </button>
                 ) : (
                   <button className="button button-primary" type="button" onClick={startStream}>
                     <Play size={14} style={{ marginRight: 6 }} fill="currentColor" /> Start Live Stream
@@ -756,7 +872,7 @@ export default function LiveMonitor() {
                   className="button button-stop"
                   type="button"
                   onClick={stopStream}
-                  disabled={!isStreaming && connectionState !== "paused"}
+                  disabled={!isStreaming && !isPaused}
                 >
                   <Square size={13} style={{ marginRight: 6 }} /> Stop Telecast
                 </button>
