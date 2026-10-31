@@ -12,7 +12,8 @@ from backend.ml.unet_model import (
     SolarFilamentUNet,
     mask_to_polygons_and_bboxes,
     binary_mask_to_rle,
-    create_detection_overlay
+    create_detection_overlay,
+    create_non_solar_rejection_overlay
 )
 from backend.app.schemas import (
     CNNDetectionResponse,
@@ -22,6 +23,91 @@ from backend.app.schemas import (
     FullAnalysisResponse,
     TelecastFrameResponse
 )
+
+
+def validate_solar_observation(img_orig: np.ndarray) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Validates whether the input image is an authentic full-disk solar observation:
+    1. Aspect Ratio: Near-square (telescope field of view, aspect <= 1.32).
+    2. Space Background: Outer corners/borders must be dark space (mean < 95, not bright/white background).
+    3. Solar Disc Geometry: Circular body with area occupying 30% - 95% of frame,
+       circular enclosing extent >= 0.82, centered within 14% of image center.
+    4. Chromospheric Texture: Sensor intensity inside disk matches H-alpha telescope distribution.
+    Rejects arbitrary everyday images (portraits, animals, clothes, landscapes, documents, cartoons).
+    """
+    if len(img_orig.shape) == 3:
+        gray = cv2.cvtColor(img_orig, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img_orig
+
+    h, w = gray.shape
+
+    # 1. Aspect ratio check
+    aspect = max(h, w) / max(1, min(h, w))
+    if aspect > 1.32:
+        return False, f"Image aspect ratio ({w}x{h}, aspect={aspect:.2f}) does not match solar telescope framing (expected ~1:1 square).", {}
+
+    # 2. Outer border brightness check (space surrounding sun must be dark)
+    bx = max(2, w // 25)
+    by = max(2, h // 25)
+    border_pixels = np.concatenate([
+        gray[0:by, :].flatten(),
+        gray[-by:, :].flatten(),
+        gray[:, 0:bx].flatten(),
+        gray[:, -bx:].flatten()
+    ])
+    border_mean = float(np.mean(border_pixels))
+    center_region = gray[h // 4:3 * h // 4, w // 4:3 * w // 4]
+    center_mean = float(np.mean(center_region))
+
+    if border_mean > 95 and border_mean >= center_mean * 0.85:
+        return False, f"Image has a bright background (border={border_mean:.1f}, center={center_mean:.1f}). Solar observations require dark space surrounding the disk.", {}
+
+    # 3. Detect the solar disk via contour analysis
+    blurred = cv2.GaussianBlur(gray, (9, 9), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not cnts:
+        return False, "No distinct bright astronomical body detected against background space.", {}
+
+    largest = max(cnts, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    total_area = float(h * w)
+    area_ratio = area / total_area
+
+    if area_ratio < 0.30 or area_ratio > 0.95:
+        return False, f"Detected object area ratio ({area_ratio:.2f}) is outside normal solar disk range (0.30 - 0.95).", {}
+
+    (cx, cy), radius = cv2.minEnclosingCircle(largest)
+    circle_area = np.pi * (radius ** 2)
+    extent = area / circle_area if circle_area > 0 else 0.0
+    center_dist = np.sqrt((cx - w / 2.0) ** 2 + (cy - h / 2.0) ** 2) / float(min(h, w))
+
+    if extent < 0.82:
+        return False, f"Detected body is non-circular (circular extent={extent:.2f}, expected >= 0.82 for Sun).", {}
+
+    if center_dist > 0.14:
+        return False, f"Solar disk is off-center (offset={center_dist:.2f}, expected <= 0.14).", {}
+
+    # 4. Chromospheric Texture check
+    disk_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(disk_mask, (int(cx), int(cy)), int(radius * 0.88), 255, -1)
+    disk_pixels = gray[disk_mask == 255]
+    if len(disk_pixels) > 0:
+        d_std = float(np.std(disk_pixels))
+        d_mean = float(np.mean(disk_pixels))
+        if d_std < 4.0:
+            return False, "Object lacks chromospheric surface variation (uniform solid shape).", {}
+        if d_mean < 35 or d_mean > 245:
+            return False, f"Mean intensity ({d_mean:.1f}) outside valid solar sensor range.", {}
+
+    return True, "Valid H-alpha full-disk solar observation", {
+        "center": (int(cx), int(cy)),
+        "radius": int(radius),
+        "extent": round(extent, 3),
+        "area_ratio": round(area_ratio, 3)
+    }
 
 
 class SolarPipelineService:
@@ -97,9 +183,28 @@ class SolarPipelineService:
         tensor = torch.from_numpy(img_resized.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(self.device)
         return img_orig, tensor, orig_shape
 
-    def detect_presence(self, image_tensor: torch.Tensor) -> CNNDetectionResponse:
+    def detect_presence(self, image_tensor: torch.Tensor, img_orig: Optional[np.ndarray] = None) -> CNNDetectionResponse:
         """Stage 1: Runs basic CNN to detect presence and dominant category."""
         t0 = time.time()
+
+        if img_orig is not None:
+            is_solar, val_reason, _ = validate_solar_observation(img_orig)
+            if not is_solar:
+                ms = round((time.time() - t0) * 1000, 2)
+                return CNNDetectionResponse(
+                    success=True,
+                    is_solar_observation=False,
+                    validation_message=val_reason,
+                    has_filament=False,
+                    filament_probability=0.0,
+                    dominant_category="None",
+                    category_scores=[
+                        CategoryScore(category_id=i, name=self.CATEGORIES.get(i, f"Class_{i}"), probability=1.0 if i == 0 else 0.0)
+                        for i in range(5)
+                    ],
+                    inference_time_ms=ms
+                )
+
         with torch.no_grad():
             outputs = self.cnn_model(image_tensor)
 
@@ -118,6 +223,7 @@ class SolarPipelineService:
         ms = round((time.time() - t0) * 1000, 2)
         return CNNDetectionResponse(
             success=True,
+            is_solar_observation=True,
             has_filament=has_filament,
             filament_probability=round(prob, 4),
             dominant_category=dom_category,
@@ -129,22 +235,98 @@ class SolarPipelineService:
         self,
         image_tensor: torch.Tensor,
         orig_shape: Tuple[int, int],
-        threshold: float = 0.4
+        threshold: float = 0.4,
+        img_orig: Optional[np.ndarray] = None
     ) -> Tuple[SegmentationResponse, np.ndarray]:
         """Stage 2: Runs U-Net to extract fine-grained segmentation masks and polygons."""
         t0 = time.time()
+
+        if img_orig is not None:
+            is_solar, val_reason, _ = validate_solar_observation(img_orig)
+            if not is_solar:
+                ms = round((time.time() - t0) * 1000, 2)
+                return SegmentationResponse(
+                    success=True,
+                    is_solar_observation=False,
+                    num_filaments_found=0,
+                    total_filament_area=0.0,
+                    coverage_percentage=0.0,
+                    has_high_solar_activity=False,
+                    filaments=[],
+                    rle_mask=None,
+                    binary_mask_base64=None,
+                    inference_time_ms=ms
+                ), np.zeros(orig_shape, dtype=np.uint8)
+
         with torch.no_grad():
             outputs = self.unet_model(image_tensor)
 
         probs = outputs["probs"][0, 0].cpu().numpy()
-        bin_mask = (probs > threshold).astype(np.uint8)
+        h_mask, w_mask = probs.shape
 
+        # 1. Solar Disk Masking: exclude dark outer space and limb ring
+        disk_mask = np.ones((h_mask, w_mask), dtype=np.uint8)
+        if img_orig is not None:
+            try:
+                _, space_mask = cv2.threshold(img_orig, 25, 255, cv2.THRESH_BINARY)
+                cnts, _ = cv2.findContours(space_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if cnts:
+                    largest = max(cnts, key=cv2.contourArea)
+                    (cx, cy), radius = cv2.minEnclosingCircle(largest)
+                    sx = w_mask / float(orig_shape[1])
+                    sy = h_mask / float(orig_shape[0])
+                    disk_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
+                    cv2.circle(disk_mask, (int(cx * sx), int(cy * sy)), int(radius * min(sx, sy) * 0.93), 1, -1)
+            except Exception:
+                disk_mask = np.ones((h_mask, w_mask), dtype=np.uint8)
+
+        # 2. Adaptive Calibration for compressed sigmoid range
+        p_disk = probs[disk_mask > 0]
+        if len(p_disk) > 0 and float(p_disk.max()) < 0.65:
+            p_max = float(p_disk.max())
+            p_mean = float(p_disk.mean())
+            p_std = float(p_disk.std())
+            sens = (threshold - 0.1) / 0.8  # Map [0.1, 0.9] -> [0.0, 1.0]
+            eff_thresh = p_mean + (0.5 + sens * 1.5) * p_std
+            eff_thresh = min(eff_thresh, p_max - 0.005)
+            effective_threshold = max(0.15, eff_thresh)
+        else:
+            effective_threshold = threshold
+
+        bin_mask = ((probs > effective_threshold) & (disk_mask > 0)).astype(np.uint8)
+
+        # Filter out tiny noise and gigantic limb artifacts
+        max_area_scaled = orig_shape[0] * orig_shape[1] * 0.15
         filaments_raw = mask_to_polygons_and_bboxes(
             bin_mask,
-            min_area=15,
+            min_area=3,
+            max_area=max_area_scaled,
             approx_epsilon=1.0,
             orig_shape=orig_shape
         )
+
+        # 3. Fallback: If no filaments found via U-Net, but image contains dark absorption structures
+        if len(filaments_raw) == 0 and img_orig is not None:
+            try:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
+                blackhat = cv2.morphologyEx(img_orig, cv2.MORPH_BLACKHAT, kernel)
+                disk_mask_orig = cv2.resize(disk_mask, (orig_shape[1], orig_shape[0]), interpolation=cv2.INTER_NEAREST)
+                blackhat_disk = cv2.bitwise_and(blackhat, blackhat, mask=disk_mask_orig)
+                _, fil_bin = cv2.threshold(blackhat_disk, 18, 255, cv2.THRESH_BINARY)
+                fil_bin_256 = cv2.resize(fil_bin, (w_mask, h_mask), interpolation=cv2.INTER_NEAREST)
+                combined = np.maximum(bin_mask, (fil_bin_256 > 0).astype(np.uint8))
+                fils_fallback = mask_to_polygons_and_bboxes(
+                    combined,
+                    min_area=3,
+                    max_area=max_area_scaled,
+                    approx_epsilon=1.0,
+                    orig_shape=orig_shape
+                )
+                if len(fils_fallback) > 0:
+                    bin_mask = combined
+                    filaments_raw = fils_fallback
+            except Exception:
+                pass
 
         filaments = [
             FilamentPolygonAnnotation(
@@ -194,11 +376,66 @@ class SolarPipelineService:
         t_start = time.time()
         img_orig, image_tensor, orig_shape = self.preprocess_image(image_bytes)
 
+        # 0. Solar Observation Domain Validation
+        is_solar, val_reason, disk_info = validate_solar_observation(img_orig)
+
+        if not is_solar:
+            total_ms = round((time.time() - t_start) * 1000, 2)
+            stage1_res = CNNDetectionResponse(
+                success=True,
+                is_solar_observation=False,
+                validation_message=val_reason,
+                has_filament=False,
+                filament_probability=0.0,
+                dominant_category="None",
+                category_scores=[
+                    CategoryScore(category_id=i, name=self.CATEGORIES.get(i, f"Class_{i}"), probability=1.0 if i == 0 else 0.0)
+                    for i in range(5)
+                ],
+                inference_time_ms=total_ms
+            )
+            stage2_res = SegmentationResponse(
+                success=True,
+                is_solar_observation=False,
+                num_filaments_found=0,
+                total_filament_area=0.0,
+                coverage_percentage=0.0,
+                has_high_solar_activity=False,
+                filaments=[],
+                rle_mask=None,
+                binary_mask_base64=None,
+                inference_time_ms=total_ms
+            )
+
+            overlay_np = create_non_solar_rejection_overlay(img_orig, val_reason)
+            success, buffer = cv2.imencode(".jpg", overlay_np, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            overlay_base64 = None
+            if success:
+                overlay_base64 = f"data:image/jpeg;base64,{base64.b64encode(buffer).decode('utf-8')}"
+
+            return FullAnalysisResponse(
+                success=True,
+                is_solar_observation=False,
+                validation_message=val_reason,
+                image_metadata={
+                    "filename": filename,
+                    "original_height": orig_shape[0],
+                    "original_width": orig_shape[1],
+                    "device": str(self.device),
+                    "is_solar_observation": False,
+                    "rejection_reason": val_reason
+                },
+                stage1_cnn=stage1_res,
+                stage2_segmentation=stage2_res,
+                overlay_image_base64=overlay_base64,
+                total_processing_time_ms=total_ms
+            )
+
         # Stage 1: Basic CNN
-        stage1_res = self.detect_presence(image_tensor)
+        stage1_res = self.detect_presence(image_tensor, img_orig=img_orig)
 
         # Stage 2: U-Net
-        stage2_res, bin_mask = self.segment_filaments(image_tensor, orig_shape, threshold=threshold)
+        stage2_res, bin_mask = self.segment_filaments(image_tensor, orig_shape, threshold=threshold, img_orig=img_orig)
 
         # Generate overlay image
         filaments_dict_list = [f.model_dump() for f in stage2_res.filaments]
@@ -214,11 +451,14 @@ class SolarPipelineService:
 
         return FullAnalysisResponse(
             success=True,
+            is_solar_observation=True,
+            validation_message="Valid H-alpha full-disk solar observation",
             image_metadata={
                 "filename": filename,
                 "original_height": orig_shape[0],
                 "original_width": orig_shape[1],
-                "device": str(self.device)
+                "device": str(self.device),
+                "is_solar_observation": True
             },
             stage1_cnn=stage1_res,
             stage2_segmentation=stage2_res,
@@ -242,7 +482,7 @@ class SolarPipelineService:
         frame_bytes = base64.b64decode(frame_base64)
         img_orig, image_tensor, orig_shape = self.preprocess_image(frame_bytes)
 
-        stage2_res, bin_mask = self.segment_filaments(image_tensor, orig_shape, threshold=threshold)
+        stage2_res, bin_mask = self.segment_filaments(image_tensor, orig_shape, threshold=threshold, img_orig=img_orig)
 
         overlay_base64 = None
         if return_overlay:
