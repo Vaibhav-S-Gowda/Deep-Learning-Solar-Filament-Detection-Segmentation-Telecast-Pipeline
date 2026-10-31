@@ -46,10 +46,14 @@ outputs/
 Thumbs.db
 
 # Node / Next.js
-portfolio/node_modules/
-portfolio/.next/
-portfolio/.turbo/
-portfolio/out/
+node_modules/
+.next/
+.turbo/
+out/
+frontend/node_modules/
+frontend/.next/
+frontend/.turbo/
+frontend/out/
 
 # Environment files
 .env
@@ -64,6 +68,6 @@ npm-debug.log*
 Research Papers/
 
 # Misc
-[metadata]_active_observations_url.json
-[metadata]_active_time_intervals.txt
+\[metadata\]_active_observations_url.json
+\[metadata\]_active_time_intervals.txt
 papers_summary_extracted.txt
