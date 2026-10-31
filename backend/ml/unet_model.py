@@ -118,7 +118,8 @@ class SolarFilamentUNet(nn.Module):
 
 def mask_to_polygons_and_bboxes(
     binary_mask: np.ndarray,
-    min_area: int = 25,
+    min_area: int = 15,
+    max_area: Optional[float] = None,
     approx_epsilon: float = 1.0,
     orig_shape: Optional[Tuple[int, int]] = None
 ) -> List[Dict[str, Any]]:
@@ -137,6 +138,10 @@ def mask_to_polygons_and_bboxes(
     for idx, cnt in enumerate(contours):
         area = cv2.contourArea(cnt)
         if area < min_area:
+            continue
+
+        scaled_area = round(float(area * scale_x * scale_y), 2)
+        if max_area is not None and scaled_area > max_area:
             continue
 
         # Polygon approximation for clean geometry
@@ -163,10 +168,8 @@ def mask_to_polygons_and_bboxes(
             round(float(bh * scale_y), 2)
         ]
 
-        scaled_area = round(float(area * scale_x * scale_y), 2)
-
         filaments.append({
-            "id": f"filament_{idx + 1}",
+            "id": f"filament_{len(filaments) + 1}",
             "segmentation": [polygon],
             "bbox": bbox,
             "area": scaled_area,
@@ -189,13 +192,14 @@ def create_detection_overlay(
     image: np.ndarray,
     binary_mask: np.ndarray,
     filaments: List[Dict[str, Any]],
-    alpha: float = 0.45
+    alpha: float = 0.55
 ) -> np.ndarray:
     """
-    Renders an overlay highlighting filaments:
-    - Glowing cyan/green color mask over segmented filaments
-    - Golden bounding boxes
-    - Filament ID and area labels
+    Renders an optical plasma bloom overlay highlighting solar filaments:
+    - Multi-stage radiant Gaussian bloom for an authentic filament glow
+    - Electric cyan/aqua core with radiant diffuse illumination
+    - Golden corner bounding boxes and indexed tags for each filament
+    - Integrated HUD badge displaying total filament count
     """
     if len(image.shape) == 2:
         vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -210,36 +214,167 @@ def create_detection_overlay(
     else:
         mask_scaled = binary_mask
 
-    # Colorize mask (Filament color: electric cyan/aqua: B=255, G=215, R=0)
-    colored_mask = np.zeros_like(vis)
-    colored_mask[mask_scaled > 0] = [255, 215, 0]
+    mask_bin = (mask_scaled > 0).astype(np.uint8) * 255
 
-    # Blend
-    cv2.addWeighted(colored_mask, alpha, vis, 1.0, 0, vis)
+    # Render glowing optical plasma bloom if filaments are present
+    if np.any(mask_bin > 0):
+        # 1. Base vibrant filament color layer (Electric Cyan: B=255, G=225, R=20)
+        filament_color = np.zeros_like(vis, dtype=np.uint8)
+        filament_color[mask_bin > 0] = [255, 225, 20]
 
-    # Draw bounding boxes and labels
-    for f in filaments:
+        # 2. Multi-tier Gaussian Blur Bloom for radiant optical glow
+        k_wide = max(15, (int(w / 32) // 2) * 2 + 1)
+        k_tight = max(7, (int(w / 64) // 2) * 2 + 1)
+        glow_wide = cv2.GaussianBlur(filament_color, (k_wide, k_wide), 0)
+        glow_tight = cv2.GaussianBlur(filament_color, (k_tight, k_tight), 0)
+
+        # 3. Inner high-intensity core (white-hot cyan: B=255, G=250, R=160)
+        core_layer = np.zeros_like(vis, dtype=np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_eroded = cv2.erode(mask_bin, kernel, iterations=1)
+        if np.any(mask_eroded > 0):
+            core_layer[mask_eroded > 0] = [255, 250, 160]
+        else:
+            core_layer[mask_bin > 0] = [255, 250, 160]
+
+        # 4. Additive synthesis: combine ambient diffuse glow + tight glow + core
+        bloom = cv2.addWeighted(glow_wide, 0.75, glow_tight, 0.85, 0)
+        bloom = cv2.addWeighted(bloom, 1.0, core_layer, 0.7, 0)
+
+        # 5. Composite glow onto the observation image
+        vis = cv2.addWeighted(vis, 1.0, bloom, 0.95, 0)
+
+        # 6. Sharp filament boundary contour for crisp definition
+        contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, contours, -1, (255, 255, 230), 1, cv2.LINE_AA)
+
+    num_filaments = len(filaments)
+
+    # Draw bounding boxes and individual filament tags
+    for idx, f in enumerate(filaments):
         bx, by, bw, bh = [int(v) for v in f["bbox"]]
-        # Ensure within image bounds
         bx = max(0, min(w - 1, bx))
         by = max(0, min(h - 1, by))
         bw = max(1, min(w - bx, bw))
         bh = max(1, min(h - by, bh))
 
-        # Box
-        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 165, 255), 2)
+        # Golden bounding box
+        cv2.rectangle(vis, (bx, by), (bx + bw, by + bh), (0, 185, 255), 1, cv2.LINE_AA)
 
-        # Label
-        label = f"{f['id']} | Area: {int(f['area'])}px"
-        cv2.putText(
+        # Tag label with high-contrast pill backdrop
+        tag_text = f"#{idx + 1} ({int(f['area']):,}px)"
+        font_scale = 0.42
+        thickness = 1
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (text_w, text_h), baseline = cv2.getTextSize(tag_text, font, font_scale, thickness)
+
+        tag_y = max(text_h + 6, by - 6)
+        tag_x = bx
+
+        # Dark background pill for label
+        cv2.rectangle(
             vis,
-            label,
-            (bx, max(15, by - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 255),
+            (tag_x, tag_y - text_h - 4),
+            (tag_x + text_w + 6, tag_y + baseline),
+            (14, 20, 27),
+            cv2.FILLED
+        )
+        cv2.rectangle(
+            vis,
+            (tag_x, tag_y - text_h - 4),
+            (tag_x + text_w + 6, tag_y + baseline),
+            (0, 185, 255),
             1,
             cv2.LINE_AA
         )
+        # White text inside label
+        cv2.putText(
+            vis,
+            tag_text,
+            (tag_x + 3, tag_y - 2),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA
+        )
+
+    # 7. Integrated HUD Badge: Number of Filaments Present in the Image
+    badge_label = f"FILAMENTS: {num_filaments}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.48
+    thickness = 1
+    (b_w, b_h), _ = cv2.getTextSize(badge_label, font, font_scale, thickness)
+    badge_w = b_w + 34
+    badge_h = b_h + 16
+
+    bx1 = w - badge_w - 14
+    by1 = 14
+    bx2 = w - 14
+    by2 = by1 + badge_h
+
+    if bx1 > 0 and by2 < h:
+        overlay_box = vis.copy()
+        cv2.rectangle(overlay_box, (bx1, by1), (bx2, by2), (14, 20, 27), cv2.FILLED)
+        cv2.addWeighted(overlay_box, 0.88, vis, 0.12, 0, vis)
+        cv2.rectangle(vis, (bx1, by1), (bx2, by2), (255, 220, 0), 1, cv2.LINE_AA)
+
+        # Glowing indicator dot
+        dot_x = bx1 + 12
+        dot_y = by1 + badge_h // 2
+        cv2.circle(vis, (dot_x, dot_y), 4, (255, 220, 0), cv2.FILLED, cv2.LINE_AA)
+        cv2.circle(vis, (dot_x, dot_y), 6, (255, 220, 0), 1, cv2.LINE_AA)
+
+        cv2.putText(
+            vis,
+            badge_label,
+            (dot_x + 10, by1 + badge_h // 2 + b_h // 2),
+            font,
+            font_scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA
+        )
+
+    return vis
+
+
+def create_non_solar_rejection_overlay(image: np.ndarray, reason: str = "") -> np.ndarray:
+    """
+    Renders an informative rejection HUD badge for images that do not contain a solar disk,
+    explicitly signaling zero solar filaments detected and out-of-domain rejection.
+    """
+    if len(image.shape) == 2:
+        vis = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        vis = image.copy()
+
+    h, w = vis.shape[:2]
+
+    badge_title = "NON-SOLAR OBSERVATION"
+    badge_sub = "FILAMENTS: 0 (OUT OF DOMAIN)"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (tw1, th1), _ = cv2.getTextSize(badge_title, font, 0.46, 1)
+    (tw2, th2), _ = cv2.getTextSize(badge_sub, font, 0.40, 1)
+    box_w = max(tw1, tw2) + 40
+    box_h = th1 + th2 + 24
+
+    x1 = max(10, w - box_w - 14)
+    y1 = 14
+    x2 = min(w - 10, x1 + box_w)
+    y2 = min(h - 10, y1 + box_h)
+
+    if x2 > x1 and y2 > y1:
+        overlay_box = vis.copy()
+        cv2.rectangle(overlay_box, (x1, y1), (x2, y2), (20, 20, 28), cv2.FILLED)
+        cv2.addWeighted(overlay_box, 0.88, vis, 0.12, 0, vis)
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (40, 140, 255), 1, cv2.LINE_AA)
+
+        dot_x = x1 + 14
+        dot_y = y1 + box_h // 2
+        cv2.circle(vis, (dot_x, dot_y), 4, (40, 140, 255), cv2.FILLED, cv2.LINE_AA)
+
+        cv2.putText(vis, badge_title, (dot_x + 10, y1 + th1 + 8), font, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(vis, badge_sub, (dot_x + 10, y1 + th1 + th2 + 16), font, 0.40, (60, 180, 255), 1, cv2.LINE_AA)
 
     return vis
