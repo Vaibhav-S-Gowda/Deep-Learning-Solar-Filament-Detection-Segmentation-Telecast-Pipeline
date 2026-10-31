@@ -20,6 +20,8 @@ class CategoryScore(BaseModel):
 
 class CNNDetectionResponse(BaseModel):
     success: bool = True
+    is_solar_observation: bool = Field(True, description="Whether the uploaded image is a valid solar disk observation")
+    validation_message: Optional[str] = Field(None, description="Validation diagnostic reason")
     has_filament: bool = Field(..., description="Whether a solar filament was detected by Stage 1 CNN")
     filament_probability: float = Field(..., description="Confidence probability of filament presence")
     dominant_category: str = Field(..., description="Dominant filament orientation or class")
@@ -29,6 +31,7 @@ class CNNDetectionResponse(BaseModel):
 
 class SegmentationResponse(BaseModel):
     success: bool = True
+    is_solar_observation: bool = Field(True, description="Whether the uploaded image is a valid solar disk observation")
     num_filaments_found: int = Field(..., description="Number of separated filament structures identified")
     total_filament_area: float = Field(..., description="Total pixel area covered by filaments")
     coverage_percentage: float = Field(0.0, description="Percentage of solar disk covered by filaments")
@@ -41,6 +44,8 @@ class SegmentationResponse(BaseModel):
 
 class FullAnalysisResponse(BaseModel):
     success: bool = True
+    is_solar_observation: bool = Field(True, description="Whether the uploaded image is a valid solar disk observation")
+    validation_message: Optional[str] = Field(None, description="Diagnostic message when non-solar images are rejected")
     image_metadata: Dict[str, Any] = Field(default_factory=dict, description="Image dimensions and capture info")
     stage1_cnn: CNNDetectionResponse = Field(..., description="Stage 1 CNN presence & classification output")
     stage2_segmentation: SegmentationResponse = Field(..., description="Stage 2 U-Net segmentation output")
