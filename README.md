@@ -20,6 +20,104 @@ This repository provides an end-to-end framework comprising:
 
 ---
 
+## System Architecture
+
+```mermaid
+flowchart TD
+    subgraph INGEST["1. Data Ingestion & Observation Sources"]
+        GONG["GONG Telescope Network (NSO)
+BBSO, CTIO, LEAR, MLSO, Teide, USO"]
+        ARCHIVE["MAGFiLO 1.0 Dataset
+H-Alpha Archive & COCO Annotations"]
+        UPLOAD["User Uploads & Telemetry
+Single-Frame H-Alpha Observations"]
+    end
+
+    subgraph PREPROC["2. Ingestion, Preprocessing & Domain Validation"]
+        NORM["Image Normalization & Preprocessing
+Aspect Check, Contrast & Grayscale Rescaling"]
+        GATE{"Astronomical Domain
+Validation Gate"}
+        REJECT["Out-of-Domain Rejection
+Diagnostic Rejection Overlay"]
+        DISK["Solar Disk Locator (Otsu)
+Calculates Center (cx, cy) & Radius R_sun"]
+    end
+
+    subgraph INFERENCE["3. Two-Stage Deep Learning Pipeline"]
+        STAGE1["Stage 1: Basic CNN Screener
+Presence Probability & Chirality Classification"]
+        STAGE2["Stage 2: Deep U-Net Segmenter
+Residual Skip Connections & Composite DiceBCE Loss"]
+        DISK_MASK["Chromospheric Disk Masking
+Restricts to r <= 0.85 R_sun (Zeros Space Background)"]
+    end
+
+    subgraph MORPHOLOGY["4. Post-Processing & Morphometric Physics Engine"]
+        FILTER["Limb Artifact & Watermark Filter
+Rejects Circular Limb Rings & Corner Logos"]
+        MORPH["Morphometric & Heliographic Analyzer
+Length (km/Mm), Width, Sinuosity, Branches, Quadrant, Limb Proximity"]
+        COMPOSITE["Visual Compositing Engine
+Solar Amber Fill, Golden Contours & Bounding Boxes"]
+    end
+
+    subgraph BACKEND["5. FastAPI Backend Engine (Python 3.11 / PyTorch)"]
+        API_ANALYZE["/api/v1/analyze
+Full Dual-Stage Processing & Diagnostics"]
+        API_STREAM["/api/v1/telecast/stream
+Live MJPEG Real-Time Stream"]
+        API_DATASET["/api/v1/dataset/sample
+Raw Solar Disk & Ground-Truth Overlay"]
+        MLFLOW["MLflow Tracking & Artifact Registry
+Loss Curves, Metrics & Model Checkpoints"]
+    end
+
+    subgraph FRONTEND["6. Next.js Observatory Web Application"]
+        UI_MONITOR["Live Telecast Monitor
+Real-Time Stream, Recording & Layer Controls"]
+        UI_DATASET["Dataset Explorer
+Detect-After Workflow & Split/Reveal Slider"]
+        UI_ANALYZE["Analysis & Diagnostics Portal
+6-Question Morphological Q&A & Overlay Download"]
+        UI_TRAIN["Training Administration
+Hyperparameter Tuning & Training Telemetry"]
+    end
+
+    %% Ingestion flows
+    GONG --> API_STREAM
+    ARCHIVE --> API_DATASET
+    UPLOAD --> API_ANALYZE
+
+    API_ANALYZE --> NORM
+    API_STREAM --> NORM
+    API_DATASET --> NORM
+
+    NORM --> GATE
+    GATE -- "Invalid Target" --> REJECT
+    GATE -- "Valid Solar Disk" --> DISK
+
+    DISK --> STAGE1
+    DISK --> DISK_MASK
+    STAGE1 --> STAGE2
+    DISK_MASK --> STAGE2
+
+    STAGE2 --> FILTER
+    FILTER --> MORPH
+    MORPH --> COMPOSITE
+
+    COMPOSITE --> API_ANALYZE
+    COMPOSITE --> API_STREAM
+    COMPOSITE --> API_DATASET
+
+    API_STREAM --> UI_MONITOR
+    API_DATASET --> UI_DATASET
+    API_ANALYZE --> UI_ANALYZE
+    MLFLOW --> UI_TRAIN
+```
+
+---
+
 ## Architecture and Methodology
 
 The system implements a decoupled, two-tier hierarchical inference pipeline designed to minimize computational expenditure while maximizing detection accuracy.
@@ -47,11 +145,20 @@ Images failing validation are immediately flagged as out-of-domain targets, retu
 - Dynamic Calibration: Incorporates adaptive probability thresholding calibrated to the active distribution within the solar disk mask, mitigating sigmoid activation compression and limb darkening edge artifacts.
 - Chromospheric Absorption Fallback: Blends high-confidence U-Net predictions with black-hat morphological absorption feature extraction to guarantee robust delineation of dark plasma threads.
 
+### Morphometric and Heliographic Physics Engine
+The pipeline analyzes every segmented structure in calibrated physical units ($R_{\odot} = 696,340\text{ km}$):
+1. Spine Length: Calibrated physical length in pixels, kilometers, and Megameters ($1\text{ Mm} = 10^3\text{ km}$) using hydraulic ribbon geometry ($L = \frac{P + \sqrt{P^2 - 16A}}{4}$) and minimum oriented bounding box major axis.
+2. Cross-Sectional Width: Mean spine thickness ($W = A / L$) and elongation aspect ratio ($L / W$).
+3. Curvature & Sinuosity: Evaluates sinuosity index ($S = L_{\text{spine}} / D_{\text{endpoints}}$) and convex hull solidity to categorize structures into Straight, Curved, or Fragmented.
+4. Spine Branching: Identifies lateral barbs and dendritic magnetic bifurcations (single continuous spine vs. multi-branch structure).
+5. Heliographic Positioning: Maps filament centroid to solar quadrants (NE, NW, SE, SW, Central Disk) and solar latitude belts (Equatorial Belt, Mid-Latitudes, Polar Crown) with radial offset ratio ($r / R_{\odot}$).
+6. Solar Limb Proximity: Flags structures near the solar limb ($r / R_{\odot} \ge 0.70$) subject to line-of-sight foreshortening versus intermediate or central disk features.
+
 ### Vector Geometry and Visual Compositing
 - Connected Components: Extracts individual discrete filament contours via border-following algorithms.
 - Polygon Approximations: Applies the Douglas-Peucker algorithm to compute lossless COCO-compliant polygon coordinates and bounding boxes.
 - Area Metrics: Computes calibrated pixel area and percentage coverage relative to the solar disk. Flags elevated solar activity when total filament area exceeds 1,000 pixels.
-- Visual Compositing: Renders an optical plasma bloom effect (electric cyan core with multi-tier Gaussian bloom), sharp boundary contours, indexed filament tags, golden bounding boxes, and an integrated HUD badge displaying total detected filament count.
+- Visual Compositing: Renders clean, high-contrast astronomical highlights (warm Solar Amber fill, sharp golden boundary contours, indexed filament tags, golden bounding boxes, and integrated HUD metrics).
 
 ---
 
