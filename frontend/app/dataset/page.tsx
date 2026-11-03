@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Activity,
   Database,
@@ -11,6 +11,10 @@ import {
   Telescope,
   CheckCircle2,
   AlertCircle,
+  Sliders,
+  Sparkles,
+  Eye,
+  Download,
 } from "lucide-react";
 import {
   getDatasetStats,
@@ -26,6 +30,42 @@ export default function DatasetPage() {
   const [sampleError, setSampleError] = useState("");
   const [loadingStats, setLoadingStats] = useState(true);
   const [loadingSample, setLoadingSample] = useState(false);
+
+  // View mode: 'raw' (unannotated), 'detected' (annotated overlay), or 'split' (reveal slider)
+  // When an image loads, it begins in 'raw' mode without premature highlighting
+  const [viewMode, setViewMode] = useState<"raw" | "detected" | "split">("raw");
+  const [hasDetected, setHasDetected] = useState<boolean>(false);
+  const [splitPosition, setSplitPosition] = useState<number>(50); // 0 to 100 percentage
+  const splitContainerRef = useRef<HTMLDivElement | null>(null);
+  const isDraggingSplitRef = useRef<boolean>(false);
+
+  const handleSplitPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    isDraggingSplitRef.current = true;
+    (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+    updateSplitFromPointer(e.clientX);
+  };
+
+  const handleSplitPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDraggingSplitRef.current) return;
+    updateSplitFromPointer(e.clientX);
+  };
+
+  const handleSplitPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    isDraggingSplitRef.current = false;
+    try {
+      (e.target as HTMLElement).releasePointerCapture?.(e.pointerId);
+    } catch {
+      // ignore
+    }
+  };
+
+  const updateSplitFromPointer = (clientX: number) => {
+    if (!splitContainerRef.current) return;
+    const rect = splitContainerRef.current.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    const pct = Math.round((x / rect.width) * 100);
+    setSplitPosition(pct);
+  };
 
   useEffect(() => {
     getDatasetStats()
@@ -45,6 +85,9 @@ export default function DatasetPage() {
     try {
       const result = await getDatasetSample();
       setSample(result);
+      // Start in pure raw mode so filaments are not automatically highlighted on load
+      setViewMode("raw");
+      setHasDetected(false);
     } catch (e: unknown) {
       setSampleError(
         e instanceof Error ? e.message : "Failed to load sample image"
@@ -152,16 +195,34 @@ export default function DatasetPage() {
                 </div>
               </div>
 
-              <button
-                type="button"
-                className="button"
-                style={{ padding: "6px 14px", height: 34, gap: 7, fontSize: 12 }}
-                onClick={() => void fetchSample()}
-                disabled={loadingSample}
-              >
-                <RefreshCw size={13} className={loadingSample ? "ds-spinning" : ""} />
-                {loadingSample ? "Retrieving Frame..." : "Load Sample Observation"}
-              </button>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {sample && !hasDetected && (
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    style={{ padding: "6px 14px", height: 34, gap: 6, fontSize: 12 }}
+                    onClick={() => {
+                      setHasDetected(true);
+                      setViewMode("detected");
+                    }}
+                    title="Run detection to identify and highlight active filaments"
+                  >
+                    <Sparkles size={13} />
+                    Detect Filaments ({sample.num_filaments_annotated})
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  className="button"
+                  style={{ padding: "6px 14px", height: 34, gap: 7, fontSize: 12 }}
+                  onClick={() => void fetchSample()}
+                  disabled={loadingSample}
+                >
+                  <RefreshCw size={13} className={loadingSample ? "ds-spinning" : ""} />
+                  {loadingSample ? "Retrieving Frame..." : "Load Sample Observation"}
+                </button>
+              </div>
             </div>
 
             {/* Solar Stage */}
@@ -173,20 +234,80 @@ export default function DatasetPage() {
               <div className="stage-grid" aria-hidden="true" />
 
               {sample ? (
-                <img
-                  className="solar-image"
-                  src={
-                    sample.overlay_base64.startsWith("data:")
-                      ? sample.overlay_base64
-                      : `data:image/jpeg;base64,${sample.overlay_base64}`
-                  }
-                  alt="Solar observation with ground-truth filament annotations"
-                />
+                <>
+                  {/* Mode 1: Split / Reveal Comparison View */}
+                  {viewMode === "split" && (
+                    <div
+                      ref={splitContainerRef}
+                      className="split-slider-container"
+                      onPointerDown={handleSplitPointerDown}
+                      onPointerMove={handleSplitPointerMove}
+                      onPointerUp={handleSplitPointerUp}
+                      title="Drag slider left/right to compare raw solar disk with identified filaments"
+                    >
+                      {/* Base Layer: Pure Raw Solar Disk */}
+                      <img
+                        src={sample.raw_base64 || sample.overlay_base64}
+                        crossOrigin="anonymous"
+                        className="split-layer"
+                        alt="Raw Grayscale Solar Observation"
+                      />
+
+                      {/* Top Layer (Clipped): Filaments Identified Layer */}
+                      <img
+                        src={sample.overlay_base64}
+                        crossOrigin="anonymous"
+                        className="split-layer"
+                        alt="Identified Solar Filaments"
+                        style={{
+                          clipPath: `inset(0 ${100 - splitPosition}% 0 0)`,
+                          WebkitClipPath: `inset(0 ${100 - splitPosition}% 0 0)`,
+                        }}
+                      />
+
+                      {/* Draggable Divider Line */}
+                      <div
+                        className="split-divider-line"
+                        style={{ left: `${splitPosition}%` }}
+                      >
+                        <div className="split-handle" role="slider" aria-valuenow={splitPosition} aria-label="Split position">
+                          <Sliders size={14} />
+                        </div>
+                      </div>
+
+                      {/* Badges indicating left/right sides */}
+                      <div className="split-label-badge split-label-left">
+                        Filaments Identified ({splitPosition}%)
+                      </div>
+                      <div className="split-label-badge split-label-right">
+                        Raw Grayscale ({100 - splitPosition}%)
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Mode 2: Annotated Filament Overlay */}
+                  {viewMode === "detected" && (
+                    <img
+                      className="solar-image"
+                      src={sample.overlay_base64}
+                      alt="Solar observation with identified filament contours"
+                    />
+                  )}
+
+                  {/* Mode 3: Clean Raw Solar Disk (Default on load) */}
+                  {viewMode === "raw" && (
+                    <img
+                      className="solar-image"
+                      src={sample.raw_base64 || sample.overlay_base64}
+                      alt="Raw unannotated H-alpha solar observation"
+                    />
+                  )}
+                </>
               ) : (
                 <div className="empty-state">
                   <div className="empty-sun"><span /></div>
                   <div className="empty-title">NO OBSERVATION LOADED</div>
-                  <p>Load a ground-truth observation from the MAGFiLO archive to inspect verified filament polygons.</p>
+                  <p>Load a calibrated observation from the MAGFiLO archive to inspect full-disk solar features.</p>
                   <button
                     type="button"
                     className="button button-primary"
@@ -202,20 +323,117 @@ export default function DatasetPage() {
 
               <div className="stage-coordinate coord-top">N [H-ALPHA 656.28 nm]</div>
               <div className="stage-coordinate coord-bottom">
-                {sample ? `${sample.file_name} • MAGFiLO 1.0` : "STANDBY • MAGFiLO ARCHIVE"}
+                {sample
+                  ? `${sample.file_name} • ${viewMode === "raw" ? "RAW OBSERVATION" : (viewMode === "split" ? "SPLIT REVEAL VIEW" : "FILAMENTS IDENTIFIED")}`
+                  : "STANDBY • MAGFiLO ARCHIVE"}
               </div>
             </div>
 
-            {/* Viewer Footer */}
-            <div className="viewer-footer">
-              <div className="overlay-key">
-                <span className="key-swatch" style={{ background: "var(--accent)" }} />
-                <span>Ground-truth contour mask & polygon boundary</span>
-              </div>
-              {sample && (
-                <span style={{ fontFamily: "var(--font-plex-mono), monospace", fontSize: 11, color: "var(--text-secondary)" }}>
-                  {sample.annotations.length} verified structures
+            {/* Split Comparison Interactive Slider Control (Visible in split mode) */}
+            {sample && viewMode === "split" && (
+              <div className="split-range-control">
+                <span className="meta-label" style={{ whiteSpace: "nowrap" }}>
+                  REVEAL FILTER
                 </span>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={splitPosition}
+                  onChange={(e) => setSplitPosition(Number(e.target.value))}
+                  style={{ flex: 1, cursor: "ew-resize" }}
+                  aria-label="Filter split position"
+                />
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    type="button"
+                    className="text-button"
+                    style={{ fontSize: 11, padding: "2px 8px" }}
+                    onClick={() => setSplitPosition(0)}
+                  >
+                    100% Gray
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    style={{ fontSize: 11, padding: "2px 8px" }}
+                    onClick={() => setSplitPosition(50)}
+                  >
+                    50 / 50
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    style={{ fontSize: 11, padding: "2px 8px" }}
+                    onClick={() => setSplitPosition(100)}
+                  >
+                    100% AI
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Viewer Footer & Mode Switching */}
+            <div className="viewer-footer">
+              {sample ? (
+                <div className="view-switch" role="group" aria-label="Layer selection">
+                  <button
+                    className={viewMode === "raw" ? "view-option selected" : "view-option"}
+                    onClick={() => setViewMode("raw")}
+                    type="button"
+                  >
+                    Raw Solar Disk
+                  </button>
+                  <button
+                    className={viewMode === "detected" ? "view-option selected" : "view-option"}
+                    onClick={() => {
+                      setHasDetected(true);
+                      setViewMode("detected");
+                    }}
+                    type="button"
+                  >
+                    Filament Overlay
+                  </button>
+                  <button
+                    className={viewMode === "split" ? "view-option selected" : "view-option"}
+                    onClick={() => {
+                      setHasDetected(true);
+                      setViewMode("split");
+                    }}
+                    type="button"
+                  >
+                    Split / Reveal Slider
+                  </button>
+                </div>
+              ) : (
+                <div className="overlay-key">
+                  <span className="key-swatch" style={{ background: "var(--accent)" }} />
+                  <span>Ground-truth contour mask & polygon boundary</span>
+                </div>
+              )}
+
+              {sample && (
+                <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                  <button
+                    type="button"
+                    className="text-button"
+                    style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 5 }}
+                    onClick={() => {
+                      const a = document.createElement("a");
+                      a.href = (viewMode === "raw" && sample.raw_base64) ? sample.raw_base64 : sample.overlay_base64;
+                      a.download = `${sample.file_name.replace(/\.[^/.]+$/, "")}_${viewMode}.jpg`;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                    }}
+                    title="Download current observation frame"
+                  >
+                    <Download size={12} /> Download
+                  </button>
+                  <span style={{ fontFamily: "var(--font-plex-mono), monospace", fontSize: 11, color: "var(--text-secondary)" }}>
+                    {sample.annotations.length} verified structures
+                  </span>
+                </div>
               )}
             </div>
 

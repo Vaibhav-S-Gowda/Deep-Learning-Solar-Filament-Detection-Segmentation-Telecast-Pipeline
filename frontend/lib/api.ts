@@ -142,6 +142,36 @@ export interface CNNDetectionResponse {
   inference_time_ms: number;
 }
 
+export interface FilamentMorphology {
+  length_px: number;
+  length_km: number;
+  length_megameters: number;
+  width_px: number;
+  width_km: number;
+  aspect_ratio: number;
+  curvature_class: "Straight" | "Curved" | "Fragmented" | string;
+  sinuosity: number;
+  is_fragmented: boolean;
+  fragment_count: number;
+  has_multiple_branches: boolean;
+  branch_count: number;
+  solar_quadrant: string;
+  heliographic_zone: string;
+  radial_distance_ratio: number;
+  disk_location_description: string;
+  is_close_to_limb: boolean;
+  proximity_to_limb: string;
+}
+
+export interface FilamentDiagnosticQA {
+  how_long: string;
+  how_wide: string;
+  curvature: string;
+  branches: string;
+  location: string;
+  close_to_limb: string;
+}
+
 export interface FilamentPolygon {
   id: string;
   segmentation: number[][];
@@ -150,6 +180,8 @@ export interface FilamentPolygon {
   confidence: number;
   category_id: number;
   category_name: string;
+  morphology?: FilamentMorphology;
+  diagnostic_qa?: FilamentDiagnosticQA;
 }
 
 export interface SegmentationResponse {
@@ -160,6 +192,12 @@ export interface SegmentationResponse {
   coverage_percentage: number;
   has_high_solar_activity: boolean;
   filaments: FilamentPolygon[];
+  solar_disk_metadata?: {
+    center: [number, number];
+    radius_px: number;
+    km_per_px: number;
+    sun_radius_km: number;
+  } | null;
   rle_mask: Record<string, unknown> | null;
   binary_mask_base64: string | null;
   inference_time_ms: number;
@@ -192,6 +230,7 @@ export interface DatasetSample {
   file_name: string;
   date_captured: string | null;
   num_filaments_annotated: number;
+  raw_base64?: string;
   overlay_base64: string;
   annotations: {
     id: number;
@@ -375,3 +414,69 @@ export const getTrainingStatus = (base = "") =>
 /** Historical training curves — `GET /api/v1/train/history` */
 export const getTrainingHistory = (base = "") =>
   apiFetch<TrainingHistory>("/api/v1/train/history", {}, base);
+
+
+// ─── GONG Real-Time Live Endpoints ────────────────────────────────────────────
+
+export interface LiveStationInfo {
+  code: string;
+  name: string;
+  location: string;
+  station_id: string;
+  frames_today: number;
+  latest_frame: string | null;
+  is_live: boolean;
+}
+
+export interface LiveLatestFrameResponse {
+  success: boolean;
+  is_live: boolean;
+  source: string;
+  file_name: string;
+  observation_time: string;
+  station_code: string;
+  station_name: string;
+  station_location: string;
+  width: number;
+  height: number;
+  frame_base64: string;
+  overlay_base64: string | null;
+  filaments_detected: number;
+  total_filament_area: number;
+  has_high_solar_activity: boolean;
+  processing_time_ms: number;
+}
+
+/** List GONG live station availability — `GET /api/v1/telecast/live/stations` */
+export const getLiveStations = (base = "") =>
+  apiFetch<{ stations: LiveStationInfo[]; source: string }>(
+    "/api/v1/telecast/live/stations",
+    {},
+    base
+  );
+
+/** Fetch latest real-time GONG frame — `GET /api/v1/telecast/live/latest-frame` */
+export const getLiveLatestFrame = (
+  station = "all",
+  threshold = 0.4,
+  overlay = true,
+  base = ""
+) =>
+  apiFetch<LiveLatestFrameResponse>(
+    `/api/v1/telecast/live/latest-frame?station=${station}&threshold=${threshold}&overlay=${overlay}`,
+    {},
+    base
+  );
+
+/** Build the live GONG MJPEG stream URL */
+export const getLiveGongStreamUrl = (
+  station = "all",
+  fps = 1,
+  threshold = 0.4,
+  overlay = true,
+  hud = true,
+  base = ""
+): string => {
+  const root = base ? normalizeBase(base) : "";
+  return `${root}/api/v1/telecast/live/stream?station=${station}&fps=${fps}&threshold=${threshold}&overlay=${overlay}&hud=${hud}`;
+};

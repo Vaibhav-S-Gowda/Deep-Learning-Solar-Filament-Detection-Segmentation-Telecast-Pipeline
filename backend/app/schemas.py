@@ -2,6 +2,36 @@ from typing import List, Dict, Optional, Any
 from pydantic import BaseModel, Field
 
 
+class FilamentMorphology(BaseModel):
+    length_px: float = Field(..., description="Estimated spine length in pixels")
+    length_km: float = Field(..., description="Physical length in kilometers")
+    length_megameters: float = Field(..., description="Physical length in Megameters (10^3 km)")
+    width_px: float = Field(..., description="Mean spine thickness in pixels")
+    width_km: float = Field(..., description="Mean spine thickness in kilometers")
+    aspect_ratio: float = Field(..., description="Elongation aspect ratio (length / width)")
+    curvature_class: str = Field(..., description="'Straight', 'Curved', or 'Fragmented'")
+    sinuosity: float = Field(..., description="Sinuosity index (arc length / direct distance)")
+    is_fragmented: bool = Field(False, description="Whether the filament structure is fragmented")
+    fragment_count: int = Field(1, description="Number of sub-fragments")
+    has_multiple_branches: bool = Field(False, description="Whether lateral branches or barbs are detected")
+    branch_count: int = Field(1, description="Number of spine branches")
+    solar_quadrant: str = Field(..., description="Heliographic quadrant (e.g. North-East, South-West)")
+    heliographic_zone: str = Field(..., description="Heliographic latitude belt")
+    radial_distance_ratio: float = Field(..., description="Distance from solar center normalized by solar radius (r / R_sun)")
+    disk_location_description: str = Field(..., description="Human-readable disk location description")
+    is_close_to_limb: bool = Field(..., description="Whether filament is close to the solar limb (r/R_sun >= 0.70)")
+    proximity_to_limb: str = Field(..., description="'Near Solar Limb', 'Intermediate Disk', or 'Central Disk'")
+
+
+class FilamentDiagnosticQA(BaseModel):
+    how_long: str = Field(..., description="Answer to: How long is this filament?")
+    how_wide: str = Field(..., description="Answer to: How wide is it?")
+    curvature: str = Field(..., description="Answer to: Is it straight, curved or fragmented?")
+    branches: str = Field(..., description="Answer to: Does it have multiple branches?")
+    location: str = Field(..., description="Answer to: Where is it located relative to the solar disk?")
+    close_to_limb: str = Field(..., description="Answer to: Is it close to the solar limb?")
+
+
 class FilamentPolygonAnnotation(BaseModel):
     id: str = Field(..., description="Unique filament identifier")
     segmentation: List[List[float]] = Field(..., description="List of [x0, y0, x1, y1, ...] polygon coordinates")
@@ -10,6 +40,8 @@ class FilamentPolygonAnnotation(BaseModel):
     confidence: float = Field(..., description="Detection confidence score (0.0 - 1.0)")
     category_id: int = Field(default=1, description="Category ID (1: Left, 2: Right, 3: Unidentifiable, 4: Ambiguous)")
     category_name: str = Field(default="Filament", description="Category display label")
+    morphology: Optional[FilamentMorphology] = None
+    diagnostic_qa: Optional[FilamentDiagnosticQA] = None
 
 
 class CategoryScore(BaseModel):
@@ -37,6 +69,7 @@ class SegmentationResponse(BaseModel):
     coverage_percentage: float = Field(0.0, description="Percentage of solar disk covered by filaments")
     has_high_solar_activity: bool = Field(False, description="Flagged if total filament area exceeds 1000px")
     filaments: List[FilamentPolygonAnnotation] = Field(default_factory=list, description="Extracted filament polygons")
+    solar_disk_metadata: Optional[Dict[str, Any]] = Field(default=None, description="Solar center, radius, and physical scale km/px")
     rle_mask: Optional[Dict[str, Any]] = Field(default=None, description="Lossless COCO-compliant RLE mask")
     binary_mask_base64: Optional[str] = Field(None, description="Base64 encoded PNG of binary segmentation mask")
     inference_time_ms: float = Field(..., description="Segmentation latency in milliseconds")

@@ -3,7 +3,7 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any, Optional, Union
 from pycocotools import mask as mask_utils
 
 
@@ -116,17 +116,183 @@ class SolarFilamentUNet(nn.Module):
 # Post-Processing & COCO / Polygon Utility Functions
 # =========================================================================
 
+def compute_filament_morphometrics(
+    pts_orig: np.ndarray,
+    solar_disk: Optional[Tuple[Tuple[float, float], float]] = None
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """
+    Computes precise morphometric and heliographic metrics answering:
+    1. How long is this filament?
+    2. How wide is it?
+    3. Is it straight, curved or fragmented?
+    4. Does it have multiple branches?
+    5. Where is it located relative to the solar disk?
+    6. Is it close to the solar limb?
+    """
+    cnt = pts_orig.reshape(-1, 1, 2).astype(np.int32)
+    area = max(1.0, float(cv2.contourArea(cnt)))
+    perimeter = max(1.0, float(cv2.arcLength(cnt, True)))
+
+    # Physical solar scale: R_sun ≈ 696,340 km
+    R_sun_km = 696340.0
+    if solar_disk is not None and solar_disk[1] > 10:
+        (cx, cy), radius = solar_disk
+        km_per_px = R_sun_km / max(1.0, float(radius))
+    else:
+        cx, cy, radius = 0.0, 0.0, 1.0
+        km_per_px = 1000.0
+
+    # 1 & 2: Length and Width (combining oriented bounding box and hydraulic ribbon geometry)
+    rect = cv2.minAreaRect(cnt)
+    rw, rh = rect[1]
+    major_axis = max(rw, rh)
+
+    disc = max(0.0, perimeter**2 - 16.0 * area)
+    l_ribbon = (perimeter + np.sqrt(disc)) / 4.0
+
+    length_px = max(major_axis, l_ribbon)
+    width_px = max(1.0, area / max(1.0, length_px))
+
+    length_km = length_px * km_per_px
+    length_Mm = length_km / 1000.0
+    width_km = width_px * km_per_px
+    aspect_ratio = max(1.0, length_px / width_px)
+
+    # 3. Straight, Curved or Fragmented (Sinuosity & Convex Hull Solidity)
+    pts = pts_orig.reshape(-1, 2)
+    p0 = pts[0]
+    dists0 = np.hypot(pts[:, 0] - p0[0], pts[:, 1] - p0[1])
+    far1 = pts[np.argmax(dists0)]
+    dists_far = np.hypot(pts[:, 0] - far1[0], pts[:, 1] - far1[1])
+    euc_span = max(1.0, float(dists_far.max()))
+    sinuosity = float(max(1.0, length_px / euc_span))
+
+    hull = cv2.convexHull(cnt)
+    hull_area = max(1.0, float(cv2.contourArea(hull)))
+    solidity = area / hull_area
+
+    if solidity < 0.42 and area > 80:
+        curvature_class = "Fragmented"
+        frag_count = max(2, int(np.ceil((1.0 - solidity) * 4)))
+        is_fragmented = True
+    elif sinuosity > 1.22:
+        curvature_class = "Curved"
+        frag_count = 1
+        is_fragmented = False
+    else:
+        curvature_class = "Straight"
+        frag_count = 1
+        is_fragmented = False
+
+    # 4. Multiple branches (Dendritic spines vs single continuous filament)
+    has_branches = bool((solidity < 0.62 and aspect_ratio > 2.2) or sinuosity > 1.38 or frag_count > 1)
+    if not has_branches:
+        branch_count = 1
+    elif solidity < 0.48 or sinuosity > 1.5:
+        branch_count = 3
+    else:
+        branch_count = 2
+
+    # 5 & 6. Solar disk relative location and limb proximity
+    M = cv2.moments(cnt)
+    if M["m00"] > 0:
+        fcx = float(M["m10"] / M["m00"])
+        fcy = float(M["m01"] / M["m00"])
+    else:
+        fcx = float(pts[:, 0].mean())
+        fcy = float(pts[:, 1].mean())
+
+    if solar_disk is not None and radius > 10:
+        dist_px = np.hypot(fcx - cx, fcy - cy)
+        rho = float(np.clip(dist_px / radius, 0.0, 1.0))
+        dx = fcx - cx
+        dy = fcy - cy
+
+        if rho < 0.18:
+            quadrant = "Central Disk"
+        elif dy < 0 and dx < 0:
+            quadrant = "North-East (NE)"
+        elif dy < 0 and dx >= 0:
+            quadrant = "North-West (NW)"
+        elif dy >= 0 and dx < 0:
+            quadrant = "South-East (SE)"
+        else:
+            quadrant = "South-West (SW)"
+
+        lat_deg = float(np.degrees(np.arcsin(np.clip(-dy / radius, -1.0, 1.0))))
+        hemi = "Northern" if lat_deg >= 0 else "Southern"
+        if abs(lat_deg) < 20:
+            lat_zone = "Equatorial Belt"
+        elif abs(lat_deg) < 55:
+            lat_zone = f"{hemi} Mid-Latitudes"
+        else:
+            lat_zone = f"{hemi} Polar Crown"
+
+        location_desc = f"{quadrant}, {lat_zone} (r/R_sun = {rho:.2f})"
+        is_close_to_limb = bool(rho >= 0.70)
+        if rho < 0.35:
+            proximity = "Central Disk"
+        elif rho < 0.70:
+            proximity = "Intermediate Disk"
+        else:
+            proximity = "Near Solar Limb"
+    else:
+        rho = 0.5
+        quadrant = "Intermediate Disk"
+        lat_zone = "Mid-Latitudes"
+        location_desc = "On Solar Disk"
+        is_close_to_limb = False
+        proximity = "Intermediate Disk"
+
+    qa = {
+        "how_long": f"Estimated spine length is {length_px:.1f} px (~{length_km:,.0f} km / {length_Mm:.1f} Mm).",
+        "how_wide": f"Estimated mean width is {width_px:.1f} px (~{width_km:,.0f} km), elongation aspect ratio {aspect_ratio:.1f}:1.",
+        "curvature": f"{curvature_class} (sinuosity ratio {sinuosity:.2f}{', multi-fragment structure' if is_fragmented else ' continuous thread'}).",
+        "branches": f"{'Yes, has ' + str(branch_count) + ' lateral branches/barbs detected.' if has_branches else 'No, single continuous spine (unbranched).'}",
+        "location": f"Located in {location_desc} (~{rho * R_sun_km:,.0f} km from disk center).",
+        "close_to_limb": f"{'Yes, close to the solar limb (r/R_sun = ' + f'{rho:.2f} ≥ 0.70).' if is_close_to_limb else 'No, situated in the ' + proximity.lower() + ' (r/R_sun = ' + f'{rho:.2f} < 0.70).'}"
+    }
+
+    morphology_dict = {
+        "length_px": round(length_px, 1),
+        "length_km": round(length_km),
+        "length_megameters": round(length_Mm, 1),
+        "width_px": round(width_px, 1),
+        "width_km": round(width_km),
+        "aspect_ratio": round(aspect_ratio, 2),
+        "curvature_class": curvature_class,
+        "sinuosity": round(sinuosity, 2),
+        "is_fragmented": is_fragmented,
+        "fragment_count": frag_count,
+        "has_multiple_branches": has_branches,
+        "branch_count": branch_count,
+        "solar_quadrant": quadrant,
+        "heliographic_zone": lat_zone,
+        "radial_distance_ratio": round(rho, 3),
+        "disk_location_description": location_desc,
+        "is_close_to_limb": is_close_to_limb,
+        "proximity_to_limb": proximity,
+    }
+
+    return morphology_dict, qa
+
+
 def mask_to_polygons_and_bboxes(
     binary_mask: np.ndarray,
     min_area: int = 15,
     max_area: Optional[float] = None,
     approx_epsilon: float = 1.0,
-    orig_shape: Optional[Tuple[int, int]] = None
-) -> List[Dict[str, Any]]:
+    orig_shape: Optional[Tuple[int, int]] = None,
+    solar_disk: Optional[Tuple[Tuple[float, float], float]] = None,
+    return_clean_mask: bool = False
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], np.ndarray]]:
     """
     Extracts individual filament connected components, COCO polygons, bounding boxes,
     and area metrics from a predicted binary mask.
     Optionally scales coordinates back to original image shape (e.g. 2048x2048).
+    
+    If solar_disk is provided ((cx, cy), radius), strictly rejects non-solar artifacts
+    such as observatory watermark logos, header text, and circular limb darkening rings.
     """
     h_mask, w_mask = binary_mask.shape
     scale_y = (orig_shape[0] / h_mask) if orig_shape else 1.0
@@ -134,13 +300,21 @@ def mask_to_polygons_and_bboxes(
 
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     filaments = []
+    clean_mask = np.zeros_like(binary_mask)
+
+    cx, cy, radius, d_sun = None, None, None, None
+    if solar_disk is not None:
+        (cx, cy), radius = solar_disk
+        d_sun = 2.0 * radius
 
     for idx, cnt in enumerate(contours):
         area = cv2.contourArea(cnt)
-        if area < min_area:
+        if area < 3:
             continue
 
         scaled_area = round(float(area * scale_x * scale_y), 2)
+        if scaled_area < min_area:
+            continue
         if max_area is not None and scaled_area > max_area:
             continue
 
@@ -153,29 +327,77 @@ def mask_to_polygons_and_bboxes(
         if len(cnt_approx) < 3:
             continue
 
-        # Flatten into [x0, y0, x1, y1, ...]
-        pts = cnt_approx.reshape(-1, 2)
-        polygon = []
-        for x, y in pts:
-            polygon.extend([round(float(x * scale_x), 2), round(float(y * scale_y), 2)])
+        # Scaled points in original image coordinate space
+        pts_orig = cnt_approx.reshape(-1, 2).astype(float)
+        pts_orig[:, 0] *= scale_x
+        pts_orig[:, 1] *= scale_y
 
-        # Bounding box [x, y, w, h]
         bx, by, bw, bh = cv2.boundingRect(cnt)
+        bw_s = bw * scale_x
+        bh_s = bh * scale_y
+
+        # Solar Disk Physical & Geometric Filtering
+        if solar_disk is not None and radius and radius > 10:
+            dists = np.hypot(pts_orig[:, 0] - cx, pts_orig[:, 1] - cy)
+            r_mean = float(dists.mean() / radius)
+            r_min = float(dists.min() / radius)
+
+            # Circular angular span around solar disk center
+            angles = np.arctan2(pts_orig[:, 1] - cy, pts_orig[:, 0] - cx)
+            angles_sort = np.sort(angles)
+            diffs = np.diff(angles_sort)
+            max_gap = max(
+                float(diffs.max()) if len(diffs) > 0 else 0,
+                float(2 * np.pi - (angles_sort[-1] - angles_sort[0]))
+            )
+            angular_span = 2 * np.pi - max_gap
+
+            # 1. Non-solar space / corner logo check (NSF/NOAA watermark stamps, observatory text)
+            if r_min > 0.95 or r_mean > 0.90:
+                continue
+
+            # 2. Giant circle / perimeter span (solar limb darkening ring)
+            # No genuine solar filament spans > 35% of the entire solar diameter
+            if bw_s > 0.35 * d_sun or bh_s > 0.35 * d_sun:
+                continue
+
+            # 3. Outer rim elongated arc
+            if r_mean > 0.78 and (bw_s > 0.20 * d_sun or bh_s > 0.20 * d_sun):
+                continue
+
+            # 4. Circular arc wrapping around the Sun (> 65 degrees)
+            if r_mean > 0.70 and angular_span > 1.15:
+                continue
+
+        # Valid filament: draw to clean mask
+        cv2.drawContours(clean_mask, [cnt], -1, 1, -1)
+
+        # Flatten into [x0, y0, x1, y1, ...]
+        polygon = []
+        for x, y in pts_orig:
+            polygon.extend([round(float(x), 2), round(float(y), 2)])
+
         bbox = [
             round(float(bx * scale_x), 2),
             round(float(by * scale_y), 2),
-            round(float(bw * scale_x), 2),
-            round(float(bh * scale_y), 2)
+            round(float(bw_s), 2),
+            round(float(bh_s), 2)
         ]
+
+        morphology_dict, qa_dict = compute_filament_morphometrics(pts_orig, solar_disk=solar_disk)
 
         filaments.append({
             "id": f"filament_{len(filaments) + 1}",
             "segmentation": [polygon],
             "bbox": bbox,
             "area": scaled_area,
-            "confidence": 0.88 + min(0.10, float(area) / 5000.0)
+            "confidence": 0.88 + min(0.10, float(area) / 5000.0),
+            "morphology": morphology_dict,
+            "diagnostic_qa": qa_dict
         })
 
+    if return_clean_mask:
+        return filaments, clean_mask
     return filaments
 
 
@@ -216,37 +438,17 @@ def create_detection_overlay(
 
     mask_bin = (mask_scaled > 0).astype(np.uint8) * 255
 
-    # Render glowing optical plasma bloom if filaments are present
+    # Render clean, unobtrusive astronomical filament highlights (Solar Amber/Crimson, no neon cyan)
     if np.any(mask_bin > 0):
-        # 1. Base vibrant filament color layer (Electric Cyan: B=255, G=225, R=20)
-        filament_color = np.zeros_like(vis, dtype=np.uint8)
-        filament_color[mask_bin > 0] = [255, 225, 20]
+        # 1. Subtle, translucent amber fill (BGR: B=20, G=140, R=255)
+        overlay_layer = vis.copy()
+        overlay_layer[mask_bin > 0] = [20, 140, 255]
+        # Blend gently so chromospheric plasma details remain visible
+        cv2.addWeighted(overlay_layer, 0.40, vis, 0.60, 0, vis)
 
-        # 2. Multi-tier Gaussian Blur Bloom for radiant optical glow
-        k_wide = max(15, (int(w / 32) // 2) * 2 + 1)
-        k_tight = max(7, (int(w / 64) // 2) * 2 + 1)
-        glow_wide = cv2.GaussianBlur(filament_color, (k_wide, k_wide), 0)
-        glow_tight = cv2.GaussianBlur(filament_color, (k_tight, k_tight), 0)
-
-        # 3. Inner high-intensity core (white-hot cyan: B=255, G=250, R=160)
-        core_layer = np.zeros_like(vis, dtype=np.uint8)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask_eroded = cv2.erode(mask_bin, kernel, iterations=1)
-        if np.any(mask_eroded > 0):
-            core_layer[mask_eroded > 0] = [255, 250, 160]
-        else:
-            core_layer[mask_bin > 0] = [255, 250, 160]
-
-        # 4. Additive synthesis: combine ambient diffuse glow + tight glow + core
-        bloom = cv2.addWeighted(glow_wide, 0.75, glow_tight, 0.85, 0)
-        bloom = cv2.addWeighted(bloom, 1.0, core_layer, 0.7, 0)
-
-        # 5. Composite glow onto the observation image
-        vis = cv2.addWeighted(vis, 1.0, bloom, 0.95, 0)
-
-        # 6. Sharp filament boundary contour for crisp definition
+        # 2. Crisp, thin boundary contour (Amber/Gold: B=0, G=190, R=255)
         contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(vis, contours, -1, (255, 255, 230), 1, cv2.LINE_AA)
+        cv2.drawContours(vis, contours, -1, (0, 190, 255), 1, cv2.LINE_AA)
 
     num_filaments = len(filaments)
 

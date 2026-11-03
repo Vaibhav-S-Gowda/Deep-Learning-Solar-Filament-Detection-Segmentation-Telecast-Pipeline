@@ -24,6 +24,8 @@ import {
   getTelecastStations,
   getSequenceFrame,
   getLiveStreamUrl,
+  getLiveGongStreamUrl,
+  getLiveLatestFrame,
   type TelecastStatus,
   type StationInfo,
   type SequenceFrameResponse,
@@ -38,7 +40,7 @@ type ConnectionState =
   | "reconnecting"
   | "error";
 
-type StreamEngineMode = "mjpeg" | "timelapse" | "video";
+type StreamEngineMode = "gonglive" | "video";
 type ViewLayerMode = "segmented" | "source";
 
 interface RecordedVideo {
@@ -68,8 +70,8 @@ function stateLabel(state: ConnectionState) {
 export default function LiveMonitor() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("disconnected");
   const [endpoint, setEndpoint] = useState(DEFAULT_API);
-  const [engineMode, setEngineMode] = useState<StreamEngineMode>("mjpeg");
-  const [selectedStation, setSelectedStation] = useState<string>("Ch");
+  const [engineMode, setEngineMode] = useState<StreamEngineMode>("gonglive");
+  const [selectedStation, setSelectedStation] = useState<string>("all");
   const [stations, setStations] = useState<StationInfo[]>([]);
   const [threshold, setThreshold] = useState<number>(0.4);
   const [streamFps, setStreamFps] = useState<number>(10);
@@ -81,6 +83,8 @@ export default function LiveMonitor() {
   const [backendStatus, setBackendStatus] = useState<TelecastStatus | null>(null);
   const [lastError, setLastError] = useState<string>("");
   const [activeFrame, setActiveFrame] = useState<SequenceFrameResponse | null>(null);
+
+
 
   // Recording state
   const [isRecording, setIsRecording] = useState<boolean>(false);
@@ -180,6 +184,8 @@ export default function LiveMonitor() {
     }
   };
 
+
+
   // Launch or resume stream
   const startStream = useCallback(() => {
     setLastError("");
@@ -187,99 +193,56 @@ export default function LiveMonitor() {
     setFrozenFrame(null);
     setConnectionState("streaming");
 
-    if (engineMode === "mjpeg") {
-      streamStartTimeRef.current = Date.now();
+    if (engineMode === "gonglive") {
       const base = getBase();
-      const url = getLiveStreamUrl(
+      const url = getLiveGongStreamUrl(
         stationRef.current,
-        streamFps,
+        1,
         thresholdRef.current,
         viewLayer === "segmented",
         true,
-        base,
-        mjpegIndexRef.current
+        base
       );
       setStreamUrl(url);
-    } else if (engineMode === "timelapse") {
-      const runSequence = async () => {
-        if (!isPlayingRef.current) return;
-        try {
-          const base = getBase();
-          const frame = await getSequenceFrame(
-            stationRef.current,
-            sequenceIndexRef.current,
-            thresholdRef.current,
-            viewLayer === "segmented",
-            base
-          );
-          if (isPlayingRef.current) {
-            setActiveFrame(frame);
-            sequenceIndexRef.current = frame.next_index;
-            setMetrics({
-              filaments: frame.filaments_detected,
-              area: frame.total_filament_area,
-              latency: frame.processing_time_ms,
-              highActivity: frame.has_high_solar_activity,
-              timestamp: frame.observation_time,
-            });
-            seqTimerRef.current = setTimeout(runSequence, Math.max(100, 1000 / streamFps));
-          }
-        } catch {
-          if (isPlayingRef.current) {
-            seqTimerRef.current = setTimeout(runSequence, 1000);
-          }
-        }
-      };
-      void runSequence();
+
+      getLiveLatestFrame(stationRef.current, thresholdRef.current, false, base)
+        .then((f) => {
+          setMetrics({
+            filaments: f.filaments_detected,
+            area: f.total_filament_area,
+            latency: f.processing_time_ms,
+            highActivity: f.has_high_solar_activity,
+            timestamp: f.observation_time,
+          });
+        })
+        .catch(() => null);
     } else if (engineMode === "video") {
       if (videoElemRef.current) {
         videoElemRef.current.play().catch(() => null);
       }
     }
-  }, [engineMode, getBase, streamFps, viewLayer]);
+  }, [engineMode, getBase, viewLayer]);
 
   const pauseStream = useCallback(async () => {
     isPlayingRef.current = false;
-    if (seqTimerRef.current) {
-      clearTimeout(seqTimerRef.current);
-      seqTimerRef.current = null;
-    }
     if (videoElemRef.current) {
       videoElemRef.current.pause();
     }
 
-    if (engineModeRef.current === "mjpeg") {
-      // Calculate where we are in the sequence so resume can pick up from here
-      if (streamStartTimeRef.current > 0) {
-        const elapsed = (Date.now() - streamStartTimeRef.current) / 1000;
-        mjpegIndexRef.current += Math.max(0, Math.floor(elapsed * streamFps));
-      }
-
-      // Disconnect the backend MJPEG HTTP stream first
+    if (engineModeRef.current === "gonglive") {
       setStreamUrl("");
-
-      // Fetch the current frame as a static base64 snapshot to freeze on screen
       try {
         const base = getBase();
-        const snapshot = await getSequenceFrame(
-          stationRef.current,
-          mjpegIndexRef.current,
-          thresholdRef.current,
-          true,
-          base
-        );
-        const src =
-          snapshot.overlay_base64 ?? snapshot.frame_base64;
+        const snap = await getLiveLatestFrame(stationRef.current, thresholdRef.current, viewLayer === "segmented", base);
+        const src = snap.overlay_base64 ?? snap.frame_base64;
         setFrozenFrame(src);
-        // Advance index so resume continues from next frame
-        mjpegIndexRef.current = snapshot.next_index;
       } catch {
         setFrozenFrame(null);
       }
     }
 
     setConnectionState("paused");
-  }, [streamFps, getBase]);
+  }, [getBase, viewLayer]);
 
   const stopStream = useCallback(() => {
     isPlayingRef.current = false;
@@ -419,49 +382,93 @@ export default function LiveMonitor() {
     let animId: number;
     const canvas = recordCanvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
 
     const renderLoop = () => {
       ctx.fillStyle = "#10151b";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      if (engineMode === "mjpeg") {
-        if (imgStreamRef.current && imgStreamRef.current.complete) {
+      let imageDrawn = false;
+
+      if (viewLayer === "split") {
+        const rawImg = splitContainerRef.current?.querySelector(".split-layer:first-child") as HTMLImageElement | null;
+        const overlayImg = splitContainerRef.current?.querySelector(".split-layer:nth-child(2)") as HTMLImageElement | null;
+
+        if (rawImg && (rawImg.complete || rawImg.naturalWidth > 0)) {
           try {
-            ctx.drawImage(imgStreamRef.current, 0, 0, canvas.width, canvas.height);
+            ctx.drawImage(rawImg, 0, 0, canvas.width, canvas.height);
+            imageDrawn = true;
           } catch {
-            // Handled gracefully during frame updates
-          }
-        } else if (frozenImgRef.current && frozenImgRef.current.complete) {
-          try {
-            ctx.drawImage(frozenImgRef.current, 0, 0, canvas.width, canvas.height);
-          } catch {
-            // Handled gracefully
+            // fallback gracefully
           }
         }
-      } else if (engineMode === "timelapse" && activeFrame) {
-        const imgObj = new Image();
-        const src = viewLayer === "segmented" && activeFrame.overlay_base64
-          ? activeFrame.overlay_base64
-          : activeFrame.frame_base64;
-        imgObj.src = src;
-        if (imgObj.complete) {
-          ctx.drawImage(imgObj, 0, 0, canvas.width, canvas.height);
+        if (overlayImg && (overlayImg.complete || overlayImg.naturalWidth > 0)) {
+          try {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(0, 0, (canvas.width * splitPosition) / 100, canvas.height);
+            ctx.clip();
+            ctx.drawImage(overlayImg, 0, 0, canvas.width, canvas.height);
+            ctx.restore();
+
+            const divX = (canvas.width * splitPosition) / 100;
+            ctx.strokeStyle = "#ffffff";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(divX, 0);
+            ctx.lineTo(divX, canvas.height);
+            ctx.stroke();
+          } catch {
+            // fallback gracefully
+          }
+        }
+      } else if (engineMode === "gonglive") {
+        const activeImg = isPaused ? frozenImgRef.current : imgStreamRef.current;
+        if (activeImg && (activeImg.complete || activeImg.naturalWidth > 0)) {
+          try {
+            ctx.drawImage(activeImg, 0, 0, canvas.width, canvas.height);
+            imageDrawn = true;
+          } catch {
+            // Handle if cross-origin
+          }
+        }
+
+        // Fallback to raw/annotated base64 frame if imgStreamRef didn't draw
+        if (!imageDrawn) {
+          const fallbackSrc = viewLayer === "source" ? rawFrameUrl : (annotatedFrameUrl || frozenFrame);
+          if (fallbackSrc) {
+            const tempImg = new Image();
+            tempImg.src = fallbackSrc;
+            if (tempImg.complete || tempImg.naturalWidth > 0) {
+              try {
+                ctx.drawImage(tempImg, 0, 0, canvas.width, canvas.height);
+                imageDrawn = true;
+              } catch {
+                // ignore
+              }
+            }
+          }
         }
       } else if (engineMode === "video" && videoElemRef.current) {
         const vid = videoElemRef.current;
-        if (!vid.paused && !vid.ended) {
-          ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+        if (vid.readyState >= 2) {
+          try {
+            ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+            imageDrawn = true;
+          } catch {
+            // ignore
+          }
         }
       }
 
+      // Burning HUD telemetry watermark when recording
       if (isRecording) {
         ctx.fillStyle = "rgba(16, 21, 27, 0.85)";
-        ctx.fillRect(12, 12, 175, 30);
+        ctx.fillRect(12, 12, 190, 30);
         ctx.strokeStyle = "#c9302c";
         ctx.lineWidth = 1;
-        ctx.strokeRect(12, 12, 175, 30);
+        ctx.strokeRect(12, 12, 190, 30);
 
         const blink = Math.floor(Date.now() / 500) % 2 === 0;
         ctx.fillStyle = blink ? "#c9302c" : "#5a1e1b";
@@ -473,7 +480,7 @@ export default function LiveMonitor() {
         ctx.font = "600 11px monospace";
         const mins = String(Math.floor(recordSeconds / 60)).padStart(2, "0");
         const secs = String(recordSeconds % 60).padStart(2, "0");
-        ctx.fillText(`REC ${mins}:${secs}`, 39, 31);
+        ctx.fillText(`REC ${mins}:${secs} | 512x512`, 38, 31);
       }
 
       animId = requestAnimationFrame(renderLoop);
@@ -481,7 +488,7 @@ export default function LiveMonitor() {
 
     animId = requestAnimationFrame(renderLoop);
     return () => cancelAnimationFrame(animId);
-  }, [engineMode, activeFrame, viewLayer, isRecording, recordSeconds, frozenFrame, connectionState]);
+  }, [engineMode, viewLayer, isRecording, recordSeconds, frozenFrame, connectionState, ]);
 
   const handleVideoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -550,8 +557,7 @@ export default function LiveMonitor() {
                 />
                 <div>
                   <div className="viewer-title">
-                    {engineMode === "mjpeg" && "CONTINUOUS TELECAST STREAM (MJPEG)"}
-                    {engineMode === "timelapse" && "CHRONOLOGICAL OBSERVATION SEQUENCE"}
+                    {engineMode === "gonglive" && "GONG REAL-TIME SOLAR TELECAST"}
                     {engineMode === "video" && "SOLAR OBSERVATION VIDEO FEED"}
                   </div>
                   <div className="viewer-subtitle">
@@ -576,33 +582,23 @@ export default function LiveMonitor() {
               <div className="stage-corner stage-br" />
               <div className="stage-grid" aria-hidden="true" />
 
-              {/* Mode 1: Live MJPEG Stream — live img while streaming, frozen snapshot while paused */}
-              {engineMode === "mjpeg" && isStreaming && streamUrl && (
+              {/* Mode 1: GONG Real-Time Live Stream */}
+              {engineMode === "gonglive" && isStreaming && streamUrl && (
                 <img
                   ref={imgStreamRef}
-                  className="solar-image"
                   src={streamUrl}
-                  alt="Solar observation telecast with filament segmentation overlay"
+                  crossOrigin="anonymous"
+                  className="solar-image"
+                  alt="GONG live solar stream"
                 />
               )}
-              {engineMode === "mjpeg" && isPaused && frozenFrame && (
+              {engineMode === "gonglive" && isPaused && frozenFrame && (
                 <img
+                  ref={frozenImgRef}
+                  crossOrigin="anonymous"
                   className="solar-image"
                   src={frozenFrame}
-                  alt="Solar observation paused frame"
-                />
-              )}
-
-              {/* Mode 2: Chronological Sequence */}
-              {engineMode === "timelapse" && (isStreaming || isPaused) && activeFrame && (
-                <img
-                  className="solar-image"
-                  src={
-                    viewLayer === "segmented" && activeFrame.overlay_base64
-                      ? activeFrame.overlay_base64
-                      : activeFrame.frame_base64
-                  }
-                  alt="Solar observation frame"
+                  alt="Paused GONG live observation"
                 />
               )}
 
@@ -641,24 +637,17 @@ export default function LiveMonitor() {
                 ref={recordCanvasRef}
                 width={512}
                 height={512}
-                style={{ display: "none" }}
+                style={{ position: "absolute", left: "-9999px", top: "-9999px", pointerEvents: "none", opacity: 0 }}
               />
 
               <div className="stage-coordinate coord-top">N [H-ALPHA 656.28 nm]</div>
               <div className="stage-coordinate coord-bottom">
                 {activeFrame?.file_name || `${selectedStation} OBSERVATORY CALIBRATED`}
               </div>
-              {(isStreaming || isPaused) && (
-                <div className="filament-count-badge">
-                  <span
-                    className="glow-dot"
-                    style={isPaused ? { background: "#e69242", boxShadow: "0 0 8px #e69242" } : undefined}
-                  />
-                  <span>{metrics.filaments} {metrics.filaments === 1 ? "FILAMENT DETECTED" : "FILAMENTS DETECTED"}</span>
-                </div>
-              )}
-              {metrics.highActivity && <div className="activity-flag" style={{ top: 52 }}>ELEVATED FILAMENT ACTIVITY</div>}
+
             </div>
+
+
 
             {/* Viewer Footer */}
             <div className="viewer-footer">
@@ -677,6 +666,7 @@ export default function LiveMonitor() {
                 >
                   Raw Solar Disk
                 </button>
+
               </div>
 
               {/* In-Browser Recording Button */}
@@ -776,25 +766,36 @@ export default function LiveMonitor() {
             <div style={{ padding: "16px 18px" }}>
               <div className="stream-mode-tabs" role="tablist">
                 <button
-                  className={`stream-tab ${engineMode === "mjpeg" ? "active" : ""}`}
-                  onClick={() => setEngineMode("mjpeg")}
+                  className={`stream-tab ${engineMode === "gonglive" ? "active" : ""}`}
+                  onClick={() => {
+                    setEngineMode("gonglive");
+                    stationRef.current = selectedStation;
+                    setFrozenFrame(null);
+                    setLastError("");
+                    isPlayingRef.current = true;
+                    setConnectionState("streaming");
+                    const base = getBase();
+                    setStreamUrl(getLiveGongStreamUrl(selectedStation, 1, thresholdRef.current, viewLayer === "segmented", true, base));
+                  }}
                   type="button"
                 >
-                  <Radio size={13} /> Live MJPEG
-                </button>
-                <button
-                  className={`stream-tab ${engineMode === "timelapse" ? "active" : ""}`}
-                  onClick={() => setEngineMode("timelapse")}
-                  type="button"
-                >
-                  <Clock size={13} /> Sequence
+                  <Radio size={13} /> GONG Real-Time Live
                 </button>
                 <button
                   className={`stream-tab ${engineMode === "video" ? "active" : ""}`}
-                  onClick={() => setEngineMode("video")}
+                  onClick={() => {
+                    setEngineMode("video");
+                    setFrozenFrame(null);
+                    setLastError("");
+                    isPlayingRef.current = true;
+                    setConnectionState("streaming");
+                    if (videoElemRef.current) {
+                      videoElemRef.current.play().catch(() => null);
+                    }
+                  }}
                   type="button"
                 >
-                  <Video size={13} /> Video File
+                  <Video size={13} /> Solar Video Feed
                 </button>
               </div>
 
@@ -840,7 +841,7 @@ export default function LiveMonitor() {
                       <input
                         type="file"
                         accept="video/mp4,video/webm,video/avi"
-                        style={{ display: "none" }}
+                        style={{ position: "absolute", left: "-9999px", top: "-9999px", pointerEvents: "none", opacity: 0 }}
                         onChange={handleVideoUpload}
                       />
                     </label>

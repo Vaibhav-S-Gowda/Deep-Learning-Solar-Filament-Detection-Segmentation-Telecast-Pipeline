@@ -13,6 +13,13 @@ from backend.app.schemas import TelecastFrameRequest, TelecastFrameResponse
 from backend.app.services.pipeline_service import SolarPipelineService
 from backend.app.routes.inference import get_pipeline_service
 from backend.ml.unet_model import create_detection_overlay
+from backend.app.services.gong_fetcher import (
+    fetch_latest_frame,
+    list_available_stations_today,
+    STATION_CODES,
+    _list_frames,
+    _directory_url,
+)
 
 router = APIRouter(prefix="/api/v1/telecast", tags=["Live Telecast Processing"])
 
@@ -106,196 +113,6 @@ async def get_telecast_stations():
     }
 
 
-@router.get("/stream", summary="Real-Time Continuous Solar Telecast Video Stream (MJPEG)")
-async def live_telecast_stream(
-    station: str = Query("Ch", description="Telescope station ('Bh', 'Ch', 'Lh', 'Mh', 'Th', 'Uh', 'all')"),
-    fps: int = Query(10, ge=1, le=30, description="Target streaming framerate (frames per second)"),
-    threshold: float = Query(0.4, ge=0.1, le=0.9, description="Filament segmentation threshold"),
-    overlay: bool = Query(True, description="Whether to overlay filament segmentation masks"),
-    hud: bool = Query(True, description="Whether to burn observatory HUD graphics onto the video stream"),
-    start_index: int = Query(0, ge=0, description="Starting frame index in sequence (supports pause/resume)"),
-    service: SolarPipelineService = Depends(get_pipeline_service)
-):
-    """
-    True real-time continuous video stream of the Sun.
-    Streams chronologically ordered H-Alpha solar observations at continuous framerates (10-30 FPS)
-    with real-time U-Net filament segmentation and observatory telemetry burned into the video.
-    Directly compatible with HTML `<img src="..." />`, `<canvas>`, and video streaming clients.
-    """
-    files = _get_sorted_station_files(station)
-    if not files:
-        raise HTTPException(status_code=404, detail="No frames available for requested station")
-
-    frame_delay = 1.0 / max(1, min(fps, 30))
-
-    async def generate_mjpeg_stream():
-        idx = start_index
-        total = len(files)
-        try:
-            while True:
-                t0 = time.time()
-                filename = files[idx % total]
-                file_path = os.path.join(SAMPLE_IMAGES_DIR, filename)
-
-                img_orig = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-                if img_orig is not None:
-                    st_code = filename[-7:-5] if len(filename) >= 7 else "GONG"
-                    st_info = GONG_STATIONS.get(st_code, {"name": "GONG Network", "station_id": st_code})
-                    obs_time = _parse_filename_date(filename)
-
-                    # Resize to standard 512x512 telecast transmission resolution
-                    img_512 = cv2.resize(img_orig, (512, 512), interpolation=cv2.INTER_AREA)
-
-                    # Run Stage 2 U-Net segmentation
-                    _, tensor, orig_shape = service.preprocess_image(cv2.imencode(".jpg", img_512)[1].tobytes())
-                    seg_res, bin_mask = service.segment_filaments(tensor, orig_shape, threshold=threshold)
-
-                    # Build frame
-                    if overlay:
-                        filaments_dict_list = [f.model_dump() for f in seg_res.filaments]
-                        frame_bgr = create_detection_overlay(img_512, bin_mask, filaments_dict_list)
-                    else:
-                        frame_bgr = cv2.cvtColor(img_512, cv2.COLOR_GRAY2BGR)
-
-                    if hud:
-                        # Top telemetry HUD bar
-                        cv2.rectangle(frame_bgr, (0, 0), (512, 34), (10, 16, 26), -1)
-                        cv2.line(frame_bgr, (0, 34), (512, 34), (45, 60, 78), 1)
-                        # Blinking LIVE dot
-                        dot_color = (134, 240, 206) if (int(time.time() * 2) % 2 == 0) else (40, 160, 130)
-                        cv2.circle(frame_bgr, (14, 17), 5, dot_color, -1)
-                        cv2.putText(
-                            frame_bgr,
-                            f"LIVE TELECAST | {st_info['station_id']} - {st_info['name'][:22]}",
-                            (26, 21),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.38,
-                            (220, 235, 245),
-                            1,
-                            cv2.LINE_AA
-                        )
-
-                        # Bottom telemetry HUD bar
-                        cv2.rectangle(frame_bgr, (0, 478), (512, 512), (10, 16, 26), -1)
-                        cv2.line(frame_bgr, (0, 478), (512, 478), (45, 60, 78), 1)
-
-                        act_label = "HIGH ACTIVITY" if seg_res.has_high_solar_activity else "NOMINAL"
-                        act_color = (98, 187, 244) if seg_res.has_high_solar_activity else (134, 240, 206)
-
-                        cv2.putText(
-                            frame_bgr,
-                            f"{obs_time}  |  FILAMENTS: {seg_res.num_filaments_found}  |  AREA: {int(seg_res.total_filament_area):,} px",
-                            (10, 498),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.34,
-                            (180, 195, 210),
-                            1,
-                            cv2.LINE_AA
-                        )
-                        cv2.putText(
-                            frame_bgr,
-                            act_label,
-                            (410, 498),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.34,
-                            act_color,
-                            1,
-                            cv2.LINE_AA
-                        )
-
-                    # JPEG encode
-                    ret, buffer = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-                    if ret:
-                        frame_bytes = buffer.tobytes()
-                        yield (
-                            b"--frame\r\n"
-                            b"Content-Type: image/jpeg\r\n"
-                            b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n" +
-                            frame_bytes + b"\r\n"
-                        )
-
-                idx += 1
-                elapsed = time.time() - t0
-                sleep_time = max(0.005, frame_delay - elapsed)
-                await asyncio.sleep(sleep_time)
-        except (asyncio.CancelledError, GeneratorExit):
-            pass
-
-    return StreamingResponse(
-        generate_mjpeg_stream(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
-
-
-@router.get("/sequence-frame", summary="Get Sequential Chronological Telecast Frame")
-async def get_sequence_frame(
-    station: str = Query("Ch", description="Station code ('Bh', 'Ch', 'Lh', 'Mh', 'Th', 'Uh', 'all')"),
-    index: int = Query(0, ge=0, description="Sequential frame index"),
-    threshold: float = Query(0.4, ge=0.1, le=0.9),
-    return_overlay: bool = Query(True),
-    service: SolarPipelineService = Depends(get_pipeline_service)
-):
-    """
-    Returns the next chronological observation frame for a telescope station with live U-Net segmentation.
-    Allows smooth sequential playback with chronological progression instead of random image jumping.
-    """
-    files = _get_sorted_station_files(station)
-    if not files:
-        raise HTTPException(status_code=404, detail="No images found for this station")
-
-    cur_idx = index % len(files)
-    chosen_file = files[cur_idx]
-    file_path = os.path.join(SAMPLE_IMAGES_DIR, chosen_file)
-
-    img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise HTTPException(status_code=500, detail="Failed to read observation frame")
-
-    st_code = chosen_file[-7:-5] if len(chosen_file) >= 7 else "GONG"
-    st_info = GONG_STATIONS.get(st_code, {"name": "GONG Network", "station_id": st_code, "location": "Global"})
-    obs_time = _parse_filename_date(chosen_file)
-
-    img_sim = cv2.resize(img, (512, 512), interpolation=cv2.INTER_AREA)
-    _, buffer = cv2.imencode(".jpg", img_sim, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    raw_bytes = buffer.tobytes()
-    frame_b64 = f"data:image/jpeg;base64,{base64.b64encode(raw_bytes).decode('utf-8')}"
-
-    # Perform segmentation
-    t0 = time.time()
-    _, tensor, orig_shape = service.preprocess_image(raw_bytes)
-    seg_res, bin_mask = service.segment_filaments(tensor, orig_shape, threshold=threshold)
-
-    overlay_b64 = None
-    if return_overlay:
-        filaments_dict_list = [f.model_dump() for f in seg_res.filaments]
-        overlay_np = create_detection_overlay(img_sim, bin_mask, filaments_dict_list)
-        ret, buf_ov = cv2.imencode(".jpg", overlay_np, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        if ret:
-            overlay_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf_ov).decode('utf-8')}"
-
-    proc_time = round((time.time() - t0) * 1000, 1)
-
-    return {
-        "success": True,
-        "index": cur_idx,
-        "next_index": (cur_idx + 1) % len(files),
-        "total_frames": len(files),
-        "file_name": chosen_file,
-        "station_code": st_code,
-        "station_name": st_info["name"],
-        "station_location": st_info.get("location", ""),
-        "observation_time": obs_time,
-        "width": 512,
-        "height": 512,
-        "frame_base64": frame_b64,
-        "overlay_base64": overlay_b64,
-        "filaments_detected": seg_res.num_filaments_found,
-        "total_filament_area": seg_res.total_filament_area,
-        "has_high_solar_activity": seg_res.has_high_solar_activity,
-        "processing_time_ms": proc_time
-    }
-
-
 @router.post("/process-frame", response_model=TelecastFrameResponse, summary="Process Live Telecast Frame")
 async def process_telecast_frame(
     req: TelecastFrameRequest,
@@ -361,3 +178,195 @@ async def get_telecast_status(service: SolarPipelineService = Depends(get_pipeli
         "stage2_unet_ready": service.unet_loaded,
         "recommended_fps": 15 if service.device.type == "cpu" else 30
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+# REAL-TIME LIVE GONG ENDPOINTS  (no API key, fully public server)
+# Base URL: https://gong2.nso.edu/HA/has/YYYYMM/YYYYMMDD/
+# ─────────────────────────────────────────────────────────────────
+
+@router.get("/live/stations", summary="List GONG stations with live frame availability RIGHT NOW")
+async def get_live_stations():
+    """
+    Polls the GONG server for today's available stations and frame counts.
+    Returns real-time data — no API key required.
+    """
+    try:
+        stations = list_available_stations_today()
+        return {"stations": stations, "source": "GONG live server (gong2.nso.edu)"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"GONG server unreachable: {e}")
+
+
+@router.get("/live/latest-frame", summary="Fetch the most recent GONG H-alpha frame from RIGHT NOW")
+async def get_live_latest_frame(
+    station: str = Query("all", description="Station code: Bh, Ch, Lh, Mh, Th, Uh, or 'all' for any"),
+    threshold: float = Query(0.4, ge=0.1, le=0.9),
+    overlay: bool = Query(True),
+    service: SolarPipelineService = Depends(get_pipeline_service),
+):
+    try:
+        filename, image_bytes, obs_time = await asyncio.to_thread(fetch_latest_frame, station)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    st_code = filename[14:16] if len(filename) >= 16 else "??"
+    st_info = STATION_CODES.get(st_code, {"name": "GONG Network", "station_id": st_code, "location": "Global"})
+
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img_orig = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+    if img_orig is None:
+        raise HTTPException(status_code=500, detail="Failed to decode live GONG frame")
+
+    img_512 = cv2.resize(img_orig, (512, 512), interpolation=cv2.INTER_AREA)
+    _, buf = cv2.imencode(".jpg", img_512, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    raw_bytes = buf.tobytes()
+    frame_b64 = f"data:image/jpeg;base64,{base64.b64encode(raw_bytes).decode()}"
+
+    t0 = time.time()
+    _, tensor, orig_shape = service.preprocess_image(raw_bytes)
+    seg_res, bin_mask = service.segment_filaments(tensor, orig_shape, threshold=threshold, img_orig=img_512)
+
+    overlay_b64 = None
+    if overlay:
+        fils_dict = [f.model_dump() for f in seg_res.filaments]
+        overlay_np = create_detection_overlay(img_512, bin_mask, fils_dict)
+        ret, buf_ov = cv2.imencode(".jpg", overlay_np, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        if ret:
+            overlay_b64 = f"data:image/jpeg;base64,{base64.b64encode(buf_ov).decode()}"
+
+    proc_ms = round((time.time() - t0) * 1000, 1)
+
+    return {
+        "success": True,
+        "is_live": True,
+        "source": "GONG real-time server (gong2.nso.edu)",
+        "file_name": filename,
+        "observation_time": obs_time,
+        "station_code": st_code,
+        "station_name": st_info["name"],
+        "station_location": st_info.get("location", ""),
+        "width": 512,
+        "height": 512,
+        "frame_base64": frame_b64,
+        "overlay_base64": overlay_b64,
+        "filaments_detected": seg_res.num_filaments_found,
+        "total_filament_area": seg_res.total_filament_area,
+        "has_high_solar_activity": seg_res.has_high_solar_activity,
+        "processing_time_ms": proc_ms,
+    }
+
+
+@router.get("/stream", summary="Real-Time Live Solar Stream from GONG Network")
+@router.get("/live/stream", summary="Real-Time Live Solar Stream from GONG Network")
+async def live_gong_stream(
+    station: str = Query("all", description="Station code: Bh, Ch, Lh, Mh, Th, Uh, or 'all'"),
+    fps: int = Query(2, ge=1, le=5),
+    threshold: float = Query(0.4, ge=0.1, le=0.9),
+    overlay: bool = Query(True),
+    hud: bool = Query(True),
+    service: SolarPipelineService = Depends(get_pipeline_service),
+):
+    frame_delay = 1.0 / max(1, min(fps, 5))
+
+    async def generate():
+        last_filename = None
+        cached_fb = None
+
+        while True:
+            t0 = time.time()
+            try:
+                filename, image_bytes, obs_time = await asyncio.to_thread(fetch_latest_frame, station)
+                is_new = (filename != last_filename)
+
+                if not is_new and cached_fb is not None:
+                    # Serve cached frame without recomputing neural inference
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(cached_fb)).encode() + b"\r\n\r\n" +
+                        cached_fb + b"\r\n"
+                    )
+                    elapsed = time.time() - t0
+                    await asyncio.sleep(max(0.1, frame_delay - elapsed))
+                    continue
+
+                last_filename = filename
+                st_code = filename[14:16] if len(filename) >= 16 else "??"
+                st_info = STATION_CODES.get(st_code, {"name": "GONG Network", "station_id": st_code})
+
+                nparr = np.frombuffer(image_bytes, np.uint8)
+                img_gray = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                if img_gray is None:
+                    await asyncio.sleep(0.5)
+                    continue
+
+                img_512 = cv2.resize(img_gray, (512, 512), interpolation=cv2.INTER_AREA)
+                _, buf = cv2.imencode(".jpg", img_512, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+
+                if overlay:
+                    _, tensor, orig_shape = service.preprocess_image(buf.tobytes())
+                    seg_res, bin_mask = service.segment_filaments(tensor, orig_shape, threshold=threshold, img_orig=img_512)
+                    fils_dict = [f.model_dump() for f in seg_res.filaments]
+                    frame_bgr = create_detection_overlay(img_512, bin_mask, fils_dict)
+                else:
+                    frame_bgr = cv2.cvtColor(img_512, cv2.COLOR_GRAY2BGR)
+                    seg_res = type("R", (), {"num_filaments_found": 0, "total_filament_area": 0, "has_high_solar_activity": False})()
+
+                if hud:
+                    # Top bar
+                    cv2.rectangle(frame_bgr, (0, 0), (512, 34), (10, 16, 26), -1)
+                    cv2.line(frame_bgr, (0, 34), (512, 34), (45, 60, 78), 1)
+                    cv2.circle(frame_bgr, (14, 17), 5, (0, 220, 80), -1)
+                    cv2.putText(frame_bgr,
+                        f"GONG LIVE | {st_info['station_id']} - {st_info['name'][:22]}",
+                        (26, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 235, 245), 1, cv2.LINE_AA)
+
+                    # Bottom bar
+                    cv2.rectangle(frame_bgr, (0, 478), (512, 512), (10, 16, 26), -1)
+                    cv2.line(frame_bgr, (0, 478), (512, 478), (45, 60, 78), 1)
+                    act_label = "HIGH ACTIVITY" if seg_res.has_high_solar_activity else "NOMINAL"
+                    act_color = (98, 187, 244) if seg_res.has_high_solar_activity else (134, 240, 206)
+                    cv2.putText(frame_bgr,
+                        f"{obs_time}  |  FILAMENTS: {seg_res.num_filaments_found}  |  AREA: {int(seg_res.total_filament_area):,} px",
+                        (10, 498), cv2.FONT_HERSHEY_SIMPLEX, 0.31, (180, 195, 210), 1, cv2.LINE_AA)
+                    cv2.putText(frame_bgr, act_label,
+                        (415, 498), cv2.FONT_HERSHEY_SIMPLEX, 0.31, act_color, 1, cv2.LINE_AA)
+
+                ret, buf_out = cv2.imencode(".jpg", frame_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                if ret:
+                    cached_fb = buf_out.tobytes()
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(cached_fb)).encode() + b"\r\n\r\n" +
+                        cached_fb + b"\r\n"
+                    )
+
+            except Exception as e:
+                err_frame = np.zeros((512, 512, 3), dtype=np.uint8)
+                cv2.putText(err_frame, "GONG Live: Polling server...", (50, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 120), 1, cv2.LINE_AA)
+                cv2.putText(err_frame, str(e)[:65], (20, 280),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1, cv2.LINE_AA)
+                _, buf_err = cv2.imencode(".jpg", err_frame)
+                fb = buf_err.tobytes()
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(fb)).encode() + b"\r\n\r\n" +
+                    fb + b"\r\n"
+                )
+
+            elapsed = time.time() - t0
+            await asyncio.sleep(max(0.1, frame_delay - elapsed))
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+    )

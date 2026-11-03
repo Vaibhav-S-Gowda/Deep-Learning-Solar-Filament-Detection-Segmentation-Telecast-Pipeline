@@ -16,6 +16,13 @@ import {
   Layers,
   Activity,
   RefreshCw,
+  Download,
+  Ruler,
+  Maximize2,
+  Compass,
+  GitBranch,
+  Navigation,
+  HelpCircle,
 } from "lucide-react";
 import {
   analyzeImage,
@@ -29,6 +36,7 @@ export default function AnalyzePage() {
   const [threshold, setThreshold] = useState<number>(0.4);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [result, setResult] = useState<FullAnalysisResponse | null>(null);
+  const [selectedFilamentId, setSelectedFilamentId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
@@ -372,18 +380,61 @@ export default function AnalyzePage() {
                       marginBottom: 16,
                     }}>
                       <div style={{
-                        padding: "6px 12px",
+                        padding: "8px 12px",
                         borderBottom: "1px solid rgba(255,255,255,0.08)",
-                        fontSize: 10,
+                        fontSize: 11,
                         color: "#8994a4",
                         fontFamily: "var(--font-plex-mono), monospace",
                         display: "flex",
+                        alignItems: "center",
                         justifyContent: "space-between",
                       }}>
-                        <span>{result.is_solar_observation === false ? "REJECTION OVERLAY" : "SEGMENTATION OVERLAY (U-NET)"}</span>
-                        <span style={{ color: result.is_solar_observation === false ? "#dd6b20" : "var(--accent)" }}>
-                          {result.is_solar_observation === false ? "Out of Domain" : "Electric Cyan Mask"}
+                        <span style={{ fontWeight: 600, letterSpacing: "0.04em" }}>
+                          {result.is_solar_observation === false ? "REJECTION OVERLAY" : "SEGMENTATION OVERLAY (U-NET)"}
                         </span>
+                        {result.is_solar_observation === false ? (
+                          <span style={{ color: "#dd6b20", fontSize: 10 }}>Out of Domain</span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!result?.overlay_image_base64) return;
+                              const a = document.createElement("a");
+                              a.href = result.overlay_image_base64;
+                              const baseName = fileName ? fileName.replace(/\.[^/.]+$/, "") : "solar_filament_overlay";
+                              a.download = `${baseName}_segmented_overlay.jpg`;
+                              document.body.appendChild(a);
+                              a.click();
+                              document.body.removeChild(a);
+                            }}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: 5,
+                              background: "rgba(235, 94, 40, 0.15)",
+                              border: "1px solid rgba(235, 94, 40, 0.4)",
+                              borderRadius: 4,
+                              color: "#ff9e6c",
+                              padding: "4px 10px",
+                              fontSize: 11,
+                              fontWeight: 600,
+                              cursor: "pointer",
+                              fontFamily: "var(--font-plex-mono), monospace",
+                              transition: "all 0.15s ease",
+                            }}
+                            onMouseEnter={(e) => {
+                              e.currentTarget.style.background = "rgba(235, 94, 40, 0.35)";
+                              e.currentTarget.style.color = "#ffffff";
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.background = "rgba(235, 94, 40, 0.15)";
+                              e.currentTarget.style.color = "#ff9e6c";
+                            }}
+                            title="Download segmented overlay image"
+                          >
+                            <Download size={13} /> Download Overlay Image
+                          </button>
+                        )}
                       </div>
                       <img
                         src={result.overlay_image_base64}
@@ -468,6 +519,301 @@ export default function AnalyzePage() {
                       </strong>
                     </div>
                   </div>
+
+                  {/* Morphological & Heliographic Q&A Inspection Panel */}
+                  {result.is_solar_observation !== false && result.stage2_segmentation.filaments.length > 0 && (
+                    <div style={{
+                      marginTop: 20,
+                      paddingTop: 18,
+                      borderTop: "1px solid var(--border)",
+                    }}>
+                      <div style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        marginBottom: 12,
+                      }}>
+                        <div>
+                          <h4 style={{ fontSize: 13, fontWeight: 700, margin: 0, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                            <Compass size={15} style={{ color: "var(--accent)" }} />
+                            Filament Morphological & Heliographic Q&A
+                          </h4>
+                          <span style={{ fontSize: 11, color: "var(--text-secondary)" }}>
+                            Select any detected structure to inspect physical geometry and solar position
+                          </span>
+                        </div>
+                        <span style={{
+                          fontSize: 10,
+                          fontFamily: "var(--font-plex-mono), monospace",
+                          background: "rgba(255, 140, 20, 0.12)",
+                          color: "#c05621",
+                          padding: "3px 8px",
+                          borderRadius: 4,
+                          border: "1px solid rgba(255, 140, 20, 0.25)"
+                        }}>
+                          {result.stage2_segmentation.filaments.length} STRUCTURES
+                        </span>
+                      </div>
+
+                      {/* Filament Selector Pill List */}
+                      <div style={{
+                        display: "flex",
+                        gap: 6,
+                        overflowX: "auto",
+                        paddingBottom: 8,
+                        marginBottom: 14,
+                      }}>
+                        {result.stage2_segmentation.filaments.map((f, idx) => {
+                          const isSelected = (selectedFilamentId || result.stage2_segmentation.filaments[0].id) === f.id;
+                          return (
+                            <button
+                              key={f.id}
+                              type="button"
+                              onClick={() => setSelectedFilamentId(f.id)}
+                              style={{
+                                flexShrink: 0,
+                                padding: "5px 10px",
+                                borderRadius: "var(--radius-sm)",
+                                fontSize: 11,
+                                fontFamily: "var(--font-plex-mono), monospace",
+                                fontWeight: isSelected ? 700 : 500,
+                                border: isSelected ? "1px solid var(--accent)" : "1px solid var(--border)",
+                                background: isSelected ? "rgba(235, 94, 40, 0.12)" : "var(--bg-elevated)",
+                                color: isSelected ? "var(--accent)" : "var(--text-secondary)",
+                                cursor: "pointer",
+                                transition: "all 0.15s ease",
+                              }}
+                            >
+                              #{idx + 1} ({Math.round(f.area)} px)
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Active Filament Morphological Q&A Grid */}
+                      {(() => {
+                        const activeFilament = result.stage2_segmentation.filaments.find(
+                          (f) => f.id === (selectedFilamentId || result.stage2_segmentation.filaments[0].id)
+                        ) || result.stage2_segmentation.filaments[0];
+
+                        if (!activeFilament) return null;
+                        const m = activeFilament.morphology;
+                        const qa = activeFilament.diagnostic_qa;
+
+                        return (
+                          <div style={{
+                            background: "var(--bg-elevated)",
+                            border: "1px solid var(--border)",
+                            borderRadius: "var(--radius-md)",
+                            padding: 14,
+                          }}>
+                            <div style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              marginBottom: 12,
+                              paddingBottom: 8,
+                              borderBottom: "1px solid var(--border)",
+                            }}>
+                              <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text-primary)" }}>
+                                Analysis for <strong style={{ color: "var(--accent)" }}>{activeFilament.id.toUpperCase().replace("_", " ")}</strong>
+                              </span>
+                              <span style={{ fontSize: 11, color: "var(--text-secondary)", fontFamily: "var(--font-plex-mono), monospace" }}>
+                                Confidence: {(activeFilament.confidence * 100).toFixed(1)}% • Area: {Math.round(activeFilament.area)} px
+                              </span>
+                            </div>
+
+                            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10 }}>
+                              {/* Q1: How long is this filament? */}
+                              <div style={{
+                                background: "rgba(0, 0, 0, 0.02)",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-sm)",
+                                padding: "10px 12px",
+                              }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                                    <Ruler size={13} style={{ color: "var(--accent)" }} />
+                                    How long is this filament?
+                                  </span>
+                                  {m && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      fontWeight: 700,
+                                      fontFamily: "var(--font-plex-mono), monospace",
+                                      color: "var(--accent)",
+                                      background: "rgba(235, 94, 40, 0.10)",
+                                      padding: "2px 6px",
+                                      borderRadius: 3,
+                                    }}>
+                                      {m.length_megameters} Mm
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                                  {qa?.how_long || (m ? `${m.length_px} px (~${m.length_km.toLocaleString()} km / ${m.length_megameters} Mm)` : "N/A")}
+                                </div>
+                              </div>
+
+                              {/* Q2: How wide is it? */}
+                              <div style={{
+                                background: "rgba(0, 0, 0, 0.02)",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-sm)",
+                                padding: "10px 12px",
+                              }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                                    <Maximize2 size={13} style={{ color: "var(--accent)" }} />
+                                    How wide is it?
+                                  </span>
+                                  {m && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      fontFamily: "var(--font-plex-mono), monospace",
+                                      color: "var(--text-secondary)",
+                                      background: "var(--bg-surface)",
+                                      padding: "2px 6px",
+                                      borderRadius: 3,
+                                      border: "1px solid var(--border)",
+                                    }}>
+                                      Aspect: {m.aspect_ratio}:1
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                                  {qa?.how_wide || (m ? `${m.width_px} px (~${m.width_km.toLocaleString()} km), aspect ratio ${m.aspect_ratio}:1` : "N/A")}
+                                </div>
+                              </div>
+
+                              {/* Q3: Is it straight, curved or fragmented? */}
+                              <div style={{
+                                background: "rgba(0, 0, 0, 0.02)",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-sm)",
+                                padding: "10px 12px",
+                              }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                                    <Compass size={13} style={{ color: "var(--accent)" }} />
+                                    Is it straight, curved or fragmented?
+                                  </span>
+                                  {m && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      fontWeight: 700,
+                                      fontFamily: "var(--font-plex-mono), monospace",
+                                      color: m.curvature_class === "Straight" ? "#2b6cb0" : (m.curvature_class === "Curved" ? "#c05621" : "#c53030"),
+                                      background: m.curvature_class === "Straight" ? "rgba(49, 130, 206, 0.12)" : (m.curvature_class === "Curved" ? "rgba(221, 107, 32, 0.12)" : "rgba(229, 62, 62, 0.12)"),
+                                      padding: "2px 6px",
+                                      borderRadius: 3,
+                                    }}>
+                                      {m.curvature_class.toUpperCase()}
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                                  {qa?.curvature || (m ? `${m.curvature_class} (sinuosity index: ${m.sinuosity})` : "N/A")}
+                                </div>
+                              </div>
+
+                              {/* Q4: Does it have multiple branches? */}
+                              <div style={{
+                                background: "rgba(0, 0, 0, 0.02)",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-sm)",
+                                padding: "10px 12px",
+                              }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                                    <GitBranch size={13} style={{ color: "var(--accent)" }} />
+                                    Does it have multiple branches?
+                                  </span>
+                                  {m && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      fontFamily: "var(--font-plex-mono), monospace",
+                                      color: m.has_multiple_branches ? "#c05621" : "#2f855a",
+                                      background: m.has_multiple_branches ? "rgba(221, 107, 32, 0.12)" : "rgba(56, 161, 105, 0.12)",
+                                      padding: "2px 6px",
+                                      borderRadius: 3,
+                                    }}>
+                                      {m.has_multiple_branches ? `${m.branch_count} Branches` : "Single Spine"}
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                                  {qa?.branches || (m ? (m.has_multiple_branches ? `Yes (${m.branch_count} branches)` : "No (single spine)") : "N/A")}
+                                </div>
+                              </div>
+
+                              {/* Q5: Where is it located relative to the solar disk? */}
+                              <div style={{
+                                background: "rgba(0, 0, 0, 0.02)",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-sm)",
+                                padding: "10px 12px",
+                              }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                                    <Navigation size={13} style={{ color: "var(--accent)" }} />
+                                    Where is it located relative to the solar disk?
+                                  </span>
+                                  {m && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      fontFamily: "var(--font-plex-mono), monospace",
+                                      color: "var(--text-secondary)",
+                                      background: "var(--bg-surface)",
+                                      padding: "2px 6px",
+                                      borderRadius: 3,
+                                      border: "1px solid var(--border)",
+                                    }}>
+                                      r/R_sun = {m.radial_distance_ratio}
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                                  {qa?.location || (m ? m.disk_location_description : "N/A")}
+                                </div>
+                              </div>
+
+                              {/* Q6: Is it close to the solar limb? */}
+                              <div style={{
+                                background: "rgba(0, 0, 0, 0.02)",
+                                border: "1px solid var(--border)",
+                                borderRadius: "var(--radius-sm)",
+                                padding: "10px 12px",
+                              }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
+                                  <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)", display: "flex", alignItems: "center", gap: 6 }}>
+                                    <HelpCircle size={13} style={{ color: "var(--accent)" }} />
+                                    Is it close to the solar limb?
+                                  </span>
+                                  {m && (
+                                    <span style={{
+                                      fontSize: 10,
+                                      fontWeight: 700,
+                                      fontFamily: "var(--font-plex-mono), monospace",
+                                      color: m.is_close_to_limb ? "#c53030" : "#2f855a",
+                                      background: m.is_close_to_limb ? "rgba(229, 62, 62, 0.12)" : "rgba(56, 161, 105, 0.12)",
+                                      padding: "2px 6px",
+                                      borderRadius: 3,
+                                    }}>
+                                      {m.proximity_to_limb.toUpperCase()}
+                                    </span>
+                                  )}
+                                </div>
+                                <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                                  {qa?.close_to_limb || (m ? (m.is_close_to_limb ? "Yes, close to limb" : "No, intermediate disk") : "N/A")}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

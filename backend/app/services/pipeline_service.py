@@ -20,6 +20,8 @@ from backend.app.schemas import (
     CategoryScore,
     SegmentationResponse,
     FilamentPolygonAnnotation,
+    FilamentMorphology,
+    FilamentDiagnosticQA,
     FullAnalysisResponse,
     TelecastFrameResponse
 )
@@ -108,6 +110,28 @@ def validate_solar_observation(img_orig: np.ndarray) -> Tuple[bool, str, Dict[st
         "extent": round(extent, 3),
         "area_ratio": round(area_ratio, 3)
     }
+
+
+def locate_solar_disk(img_gray: np.ndarray) -> Optional[Tuple[Tuple[float, float], float]]:
+    """
+    Locates the solar disk center (cx, cy) and radius R using Otsu thresholding.
+    Robust to corner observatory logos, header text, and dark background space.
+    """
+    try:
+        blurred = cv2.GaussianBlur(img_gray, (9, 9), 0)
+        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            return None
+        largest = max(cnts, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        h, w = img_gray.shape[:2]
+        if area < 0.20 * (h * w):
+            return None
+        (cx, cy), radius = cv2.minEnclosingCircle(largest)
+        return ((float(cx), float(cy)), float(radius))
+    except Exception:
+        return None
 
 
 class SolarPipelineService:
@@ -264,21 +288,30 @@ class SolarPipelineService:
         probs = outputs["probs"][0, 0].cpu().numpy()
         h_mask, w_mask = probs.shape
 
-        # 1. Solar Disk Masking: exclude dark outer space and limb ring
-        disk_mask = np.ones((h_mask, w_mask), dtype=np.uint8)
+        # 1. Solar Disk Geometry & Masking: strictly isolate the solar disk
+        # and eliminate outer space, observatory logos (NSF, NOAA), timestamp text, and limb ring
+        solar_disk_geom = None
         if img_orig is not None:
-            try:
-                _, space_mask = cv2.threshold(img_orig, 25, 255, cv2.THRESH_BINARY)
-                cnts, _ = cv2.findContours(space_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if cnts:
-                    largest = max(cnts, key=cv2.contourArea)
-                    (cx, cy), radius = cv2.minEnclosingCircle(largest)
-                    sx = w_mask / float(orig_shape[1])
-                    sy = h_mask / float(orig_shape[0])
-                    disk_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
-                    cv2.circle(disk_mask, (int(cx * sx), int(cy * sy)), int(radius * min(sx, sy) * 0.93), 1, -1)
-            except Exception:
-                disk_mask = np.ones((h_mask, w_mask), dtype=np.uint8)
+            solar_disk_geom = locate_solar_disk(img_orig)
+
+        if solar_disk_geom is None:
+            tensor_gray = (image_tensor[0, 0].detach().cpu().numpy() * 255).astype(np.uint8)
+            tg_geom = locate_solar_disk(tensor_gray)
+            if tg_geom is not None:
+                (tcx, tcy), trad = tg_geom
+                scale_x = orig_shape[1] / float(tensor_gray.shape[1])
+                scale_y = orig_shape[0] / float(tensor_gray.shape[0])
+                solar_disk_geom = ((tcx * scale_x, tcy * scale_y), trad * min(scale_x, scale_y))
+            else:
+                solar_disk_geom = ((orig_shape[1] / 2.0, orig_shape[0] / 2.0), min(orig_shape) * 0.45)
+
+        (cx, cy), radius = solar_disk_geom
+        sx = w_mask / float(orig_shape[1])
+        sy = h_mask / float(orig_shape[0])
+
+        # Mask disk with 0.85 * radius to exclude steep limb darkening drop-off
+        disk_mask = np.zeros((h_mask, w_mask), dtype=np.uint8)
+        cv2.circle(disk_mask, (int(cx * sx), int(cy * sy)), int(radius * min(sx, sy) * 0.85), 1, -1)
 
         # 2. Adaptive Calibration for compressed sigmoid range
         p_disk = probs[disk_mask > 0]
@@ -295,38 +328,21 @@ class SolarPipelineService:
 
         bin_mask = ((probs > effective_threshold) & (disk_mask > 0)).astype(np.uint8)
 
-        # Filter out tiny noise and gigantic limb artifacts
+        # Filter out tiny noise, giant limb circle, and off-disk artifacts
         max_area_scaled = orig_shape[0] * orig_shape[1] * 0.15
-        filaments_raw = mask_to_polygons_and_bboxes(
+        filaments_raw, clean_bin_mask = mask_to_polygons_and_bboxes(
             bin_mask,
-            min_area=3,
+            min_area=15,
             max_area=max_area_scaled,
             approx_epsilon=1.0,
-            orig_shape=orig_shape
+            orig_shape=orig_shape,
+            solar_disk=solar_disk_geom,
+            return_clean_mask=True
         )
+        bin_mask = clean_bin_mask
 
-        # 3. Fallback: If no filaments found via U-Net, but image contains dark absorption structures
-        if len(filaments_raw) == 0 and img_orig is not None:
-            try:
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (35, 35))
-                blackhat = cv2.morphologyEx(img_orig, cv2.MORPH_BLACKHAT, kernel)
-                disk_mask_orig = cv2.resize(disk_mask, (orig_shape[1], orig_shape[0]), interpolation=cv2.INTER_NEAREST)
-                blackhat_disk = cv2.bitwise_and(blackhat, blackhat, mask=disk_mask_orig)
-                _, fil_bin = cv2.threshold(blackhat_disk, 18, 255, cv2.THRESH_BINARY)
-                fil_bin_256 = cv2.resize(fil_bin, (w_mask, h_mask), interpolation=cv2.INTER_NEAREST)
-                combined = np.maximum(bin_mask, (fil_bin_256 > 0).astype(np.uint8))
-                fils_fallback = mask_to_polygons_and_bboxes(
-                    combined,
-                    min_area=3,
-                    max_area=max_area_scaled,
-                    approx_epsilon=1.0,
-                    orig_shape=orig_shape
-                )
-                if len(fils_fallback) > 0:
-                    bin_mask = combined
-                    filaments_raw = fils_fallback
-            except Exception:
-                pass
+        # 3. Fallback: Disabled morphological blackhat to prevent artificial limb ring artifacts.
+        # Deep U-Net provides authentic physical segmentation directly.
 
         filaments = [
             FilamentPolygonAnnotation(
@@ -336,7 +352,9 @@ class SolarPipelineService:
                 area=f["area"],
                 confidence=round(f["confidence"], 4),
                 category_id=1,
-                category_name="Solar Filament"
+                category_name="Solar Filament",
+                morphology=FilamentMorphology(**f["morphology"]) if f.get("morphology") else None,
+                diagnostic_qa=FilamentDiagnosticQA(**f["diagnostic_qa"]) if f.get("diagnostic_qa") else None,
             )
             for f in filaments_raw
         ]
@@ -353,6 +371,13 @@ class SolarPipelineService:
         rle = binary_mask_to_rle(bin_mask)
         ms = round((time.time() - t0) * 1000, 2)
 
+        solar_meta = {
+            "center": [float(cx), float(cy)],
+            "radius_px": float(radius),
+            "km_per_px": round(696340.0 / max(1.0, float(radius)), 2),
+            "sun_radius_km": 696340.0
+        }
+
         resp = SegmentationResponse(
             success=True,
             num_filaments_found=len(filaments),
@@ -360,6 +385,7 @@ class SolarPipelineService:
             coverage_percentage=coverage_pct,
             has_high_solar_activity=has_high_activity,
             filaments=filaments,
+            solar_disk_metadata=solar_meta,
             rle_mask=rle,
             binary_mask_base64=mask_b64,
             inference_time_ms=ms
